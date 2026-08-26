@@ -1,17 +1,20 @@
 # The Sovereign Stream
 
-Operational event streams redeliver and reorder. This repository proves a stream
-processor handles both correctly, on a production-shaped Google Cloud
-architecture.
+EventProof is a production-shaped proof of concept for a replayable GCP event
+architecture. It incrementally proves state correctness, materialization,
+recovery, observability, bounded querying, infrastructure reproducibility and
+cost-controlled operation.
 
 Code namespace: `eventproof`.
 
 ## The problem
 
-Any at-least-once pipeline eventually delivers the same event twice, and any
-distributed producer eventually delivers an older event after a newer one. Most
-streaming demonstrations measure throughput on clean, ordered input. This one
-measures correctness under redelivery and reordering.
+Operational event streams redeliver and reorder. Any at-least-once pipeline
+eventually delivers the same event twice, and any distributed producer eventually
+delivers an older event after a newer one. Most streaming demonstrations measure
+throughput on clean, ordered input. State correctness under redelivery and
+reordering is the first thing this project proves, and the foundation the later
+layers build on.
 
 ## The two invariants
 
@@ -30,6 +33,10 @@ Correctness first, infrastructure second. State transitions are proved in a loca
 Flink MiniCluster against deterministic input before a broker, container or cloud
 resource enters the picture: a wrong transition is easiest to catch when nothing
 else can hide it.
+
+Each layer proves one thing and is not evidence for the layers above it. The full
+ladder, from deterministic contract tests to cloud cost and teardown evidence, is
+in [`docs/end-to-end-plan.md`](docs/end-to-end-plan.md).
 
 ## Architecture
 

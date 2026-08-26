@@ -13,4 +13,3 @@ indent_size = 4
 [*.{json,md,yml,yaml}]
 indent_style = space
 indent_size = 2
-

@@ -3,6 +3,7 @@ package dev.eventproof.streaming;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertThrows;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
 import java.util.ArrayList;
 import java.util.List;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
@@ -72,6 +73,52 @@ public class CurrentStateJobTest {
         assertEquals(1, output.size());
         assertEquals(newer.getEventId(), output.get(0).getEventId());
         assertEquals("completed", output.get(0).getState());
+    }
+
+    @Test
+    public void parserAcceptsZeroButRejectsEveryOtherSequenceShape() throws Exception {
+        ParseOperationalState parser = new ParseOperationalState();
+
+        assertEquals(
+                Integer.valueOf(0),
+                parser.map(lineWithSequence("\"sequence\":0,")).sequence);
+
+        // A fractional value is a malformed integer, so Jackson rejects it before
+        // the contract check runs.
+        assertThrows(
+                JsonProcessingException.class,
+                () -> parser.map(lineWithSequence("\"sequence\":1.5,")));
+
+        // Missing and null both reach the contract check as a null Integer.
+        for (String sequence : List.of("", "\"sequence\":null,", "\"sequence\":-1,")) {
+            assertThrows(
+                    "sequence fragment: " + sequence,
+                    IllegalArgumentException.class,
+                    () -> parser.map(lineWithSequence(sequence)));
+        }
+    }
+
+    @Test
+    public void parserRejectsASecondObjectOnTheLineAndUnknownFields() {
+        ParseOperationalState parser = new ParseOperationalState();
+        String line = lineWithSequence("\"sequence\":0,");
+
+        assertThrows(JsonProcessingException.class, () -> parser.map(line + line));
+        assertThrows(
+                JsonProcessingException.class,
+                () -> parser.map(line.replace("\"state\":", "\"unexpected\":1,\"state\":")));
+    }
+
+    private static String lineWithSequence(String sequenceField) {
+        return "{\"schema_version\":\"operational-state.v1\","
+                + "\"event_id\":\"" + "c".repeat(64) + "\","
+                + "\"run_id\":\"parser-test\","
+                + sequenceField
+                + "\"source\":\"synthetic\",\"entity_type\":\"resource\","
+                + "\"entity_id\":\"resource-0007\",\"event_type\":\"state.updated\","
+                + "\"event_time\":\"2026-08-25T00:00:00Z\","
+                + "\"received_at\":\"2026-08-25T00:00:01Z\","
+                + "\"state\":\"processing\"}";
     }
 
     private static List<OperationalStateEvent> run(OperationalStateEvent... events)

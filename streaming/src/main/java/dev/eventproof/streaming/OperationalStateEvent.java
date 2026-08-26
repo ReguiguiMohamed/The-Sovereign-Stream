@@ -7,7 +7,9 @@ public class OperationalStateEvent implements Serializable {
     public String schemaVersion;
     public String eventId;
     public String runId;
-    public int sequence;
+    // Boxed so a missing or null sequence arrives as null instead of defaulting
+    // to a valid-looking 0. ParseOperationalState rejects it.
+    public Integer sequence;
     public String source;
     public String entityType;
     public String entityId;
@@ -22,7 +24,7 @@ public class OperationalStateEvent implements Serializable {
             String schemaVersion,
             String eventId,
             String runId,
-            int sequence,
+            Integer sequence,
             String source,
             String entityType,
             String entityId,
