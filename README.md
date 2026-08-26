@@ -1,120 +1,127 @@
-# EventProof GCP
+# The Sovereign Stream
 
-Published as **The Sovereign Stream**:
-<https://github.com/ReguiguiMohamed/The-Sovereign-Stream>. That is the public
-repository name only; the technical identifiers in this project remain
-`eventproof`, `dev.eventproof` and `operational-state.v1`.
+Operational event streams redeliver and reorder. This repository proves a stream
+processor handles both correctly, and shows the evidence, on a production-shaped
+Google Cloud architecture.
 
-EventProof is a correctness proof for operational event streams
-targeted at Google Cloud. It demonstrates deterministic duplicate delivery and
-out-of-order state updates before any company-specific adapter or cloud resource
-is introduced.
+Code namespace: `eventproof`.
 
-The planned cloud route is Managed Service for Apache Kafka, Apache Flink on GKE,
-Bigtable and a bounded Cloud Run query API. The region and external event contract
-will be selected once the use case and data-residency
-requirements are known.
+## The problem
 
-There is no local Kafka broker in this project. Kafka is integrated only against
-Google Cloud Managed Service for Apache Kafka, and only during the controlled GCP
-staging and evidence window. The free local correctness path is the deterministic
-generator, a Flink MiniCluster, the Bigtable emulator and a bounded local query
-API.
+Any at-least-once pipeline eventually delivers the same event twice, and any
+distributed producer eventually delivers an older event after a newer one. Most
+streaming demonstrations sidestep both by measuring throughput on clean, ordered
+input. Correctness under redelivery and reordering is what actually breaks
+systems in production, so that is what this project measures.
 
-## Current status
+## The two invariants
 
-Implemented and tested locally:
+The project exists to hold these under automated test:
 
-- strict `operational-state.v1` JSON Schema;
-- deterministic baseline, exact-duplicate and 120-second late scenarios;
-- verification manifests recording arrival order, duplicate relationships and
-  expected current state per entity;
-- tests for schema validation, repeatability, identity, hashes, scenario semantics
-  and invalid inputs;
-- a Flink 2.2.1 job that reads `operational-state.v1` NDJSON, keys by `entity_id`
-  and emits only events that advance current state;
-- local MiniCluster tests for exact duplicate suppression and preservation of a
-  newer state after an event arrives 120 seconds late.
+1. **An exact redelivery is acknowledged but never applied twice.** A duplicate
+   event produces no second current-state update.
+2. **A late event never overwrites newer state.** An event whose `event_time` is
+   120 seconds older than the entity's current state is accepted as delivered,
+   but the newer state stands.
 
-Not implemented:
+Both are evaluated per entity, from deterministic input, with the expected result
+recorded in a manifest before the stream processor runs.
 
-- any external adapter;
-- Kafka, Bigtable, GKE or Cloud Run clients;
-- containers, Terraform resources or deployment manifests;
-- any cloud test or production-readiness claim.
+## Approach
 
-No GCP resource has been created by this repository.
+Correctness first, infrastructure second. State transitions are proved in a local
+Flink MiniCluster against a deterministic generator before any broker, container
+or cloud resource is introduced. Ingestion plumbing cannot conceal a wrong state
+transition when the transition is already under test.
 
-## Local commands
+Every claim carries an explicit boundary: designed only, implemented locally,
+tested locally, or executed in GCP. Nothing is described as working in the cloud
+until it has run there and produced timestamped evidence.
+
+## Architecture
+
+Target path:
+
+```text
+event source
+  -> Managed Service for Apache Kafka
+  -> Apache Flink 2.2.1 on GKE
+  -> Bigtable current state
+  -> bounded Cloud Run query API
+```
+
+GCS holds checkpoints and savepoints, Managed Prometheus holds runtime metrics,
+and Terraform defines every resource.
+
+Local path, which is free, needs no broker, and gates every cloud step:
+
+```text
+deterministic generator (NDJSON)
+  -> Apache Flink 2.2.1 MiniCluster
+  -> Bigtable emulator current state
+  -> bounded local query API
+```
+
+Kafka is integrated in exactly one place: Google Cloud Managed Service for Apache
+Kafka, during a controlled, time-capped evidence window. There is no local broker.
+
+## Status
+
+| Capability | Boundary |
+| --- | --- |
+| `operational-state.v1` contract and canonical encoding | Tested locally |
+| Deterministic baseline, duplicate and late-120s scenarios | Tested locally |
+| Flink current-state job with keyed newest-wins state | Tested locally |
+| Duplicate suppression and per-entity late-state preservation | Tested locally |
+| Bigtable materialization and bounded query API | Designed only |
+| Checkpoint and restart recovery, metrics, containers | Designed only |
+| Managed Kafka, GKE, Cloud Run and Terraform resources | Designed only |
+| Every component above, in Google Cloud | Not executed in GCP |
+
+No GCP resource has been created by this repository. No exactly-once processing,
+production readiness or cloud validation is claimed.
+
+## Quick start
+
+Requires Python 3.12+, JDK 17 and Maven 3.8.6+.
 
 ```bash
 python -m pip install ".[test]"
-python -m compileall -q eventproof tests
-python -m unittest discover -s tests -v
+python -m unittest discover -s tests
 mvn --batch-mode --file streaming/pom.xml verify
 ```
 
-Generate deterministic baseline events:
+Run a late delivery end to end:
 
 ```bash
 python -m eventproof.simulator \
-  --run-id local-smoke \
-  --seed 20260824 \
-  --count 10 \
-  --output benchmarks/evidence/local-smoke.events.ndjson \
-  --manifest benchmarks/evidence/local-smoke.manifest.ndjson
-```
+  --run-id demo --seed 20260826 --count 3 --scenario late-120s \
+  --output benchmarks/evidence/demo.events.ndjson \
+  --manifest benchmarks/evidence/demo.manifest.ndjson
 
-`--scenario duplicate` emits the first event again as the second arrival. The
-copy has the same `event_id`, timestamps and canonical payload. A future consumer
-must acknowledge it without applying it twice.
-
-`--scenario late-120s` emits `completed` state for one entity, then delivers a
-different `processing` event for that entity whose `event_time` is exactly 120
-seconds older and whose `received_at` is later. Both unique events are accepted,
-but expected current state remains `completed`.
-
-Both failure scenarios require `--count` of at least 2.
-
-Run generated NDJSON through the local Flink job with JDK 17 and Maven 3.8.6+
-(Maven 3.9.16 was used for the recorded local run):
-
-```bash
 mvn --file streaming/pom.xml \
-  -Devents.file=../benchmarks/evidence/local-smoke.events.ndjson \
+  -Devents.file=../benchmarks/evidence/demo.events.ndjson \
   compile exec:exec
 ```
 
-The path is resolved from the `streaming/` Maven module. The job prints only
-current-state updates. A unique late event still counts as accepted in the
-manifest, but it does not produce a current-state update when a newer event for
-that entity already exists.
+The job prints current-state updates only. The event delivered 120 seconds late
+produces none, and the printed result matches `expected_current_state` in the
+generated manifest.
 
-## Manifest
+## Repository map
 
-The manifest contains one `record: "event"` line per delivery followed by one
-`record: "summary"` line. The summary records accepted-event count, duplicate and
-late arrival indexes, and `expected_current_state` for every entity. These are
-local expectations only; no streaming consumer enforces them yet.
-
-## Repository boundaries
-
-| Path | Responsibility |
+| Path | Contents |
 | --- | --- |
-| `eventproof/` | Event helpers and deterministic scenario generation |
-| `contracts/` | Versioned schemas shared by future producers and consumers |
-| `apps/` | Future external adapter and bounded query API |
-| `streaming/` | Flink current-state job and local MiniCluster tests |
-| `infra/` | Future Terraform roots after the local gate |
-| `benchmarks/` | Untracked local evidence |
-| `docs/` | Architecture and backlog |
+| [`contracts/`](contracts/) | Versioned event schemas |
+| [`eventproof/`](eventproof/README.md) | Event model and deterministic scenario generator |
+| [`streaming/`](streaming/README.md) | Flink current-state job and MiniCluster tests |
+| [`apps/`](apps/README.md) | External adapter and bounded query API |
+| [`infra/`](infra/README.md) | Terraform roots |
+| [`docs/`](docs/) | Architecture decision, delivery plan and backlog |
 
-## Safety
-
-- Terraform `apply` and `destroy` require explicit human approval.
-- Secrets, credentials, Terraform state and raw evidence are ignored.
-- Cloud reports must distinguish designed, implemented locally, tested locally
-  and executed in GCP.
-
-The full delivery sequence and its cost gates are in
+The delivery sequence, cost gates and truth boundaries are in
 [`docs/end-to-end-plan.md`](docs/end-to-end-plan.md).
+
+## License
+
+MIT. See [LICENSE](LICENSE).
