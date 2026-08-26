@@ -164,16 +164,6 @@ public class BigtableCurrentStateTest {
         assertEquals("completed", current.getState());
     }
 
-    @Test
-    public void rowKeySeparatorCannotCollideAcrossEntityTypeAndId() {
-        assertEquals(
-                "resource#resource-0000",
-                CurrentStateRow.rowKey("resource", "resource-0000"));
-        // Without escaping both of these would be "a#b#c".
-        org.junit.Assert.assertNotEquals(
-                CurrentStateRow.rowKey("a#b", "c"), CurrentStateRow.rowKey("a", "b#c"));
-    }
-
     private int rowCount() {
         int rows = 0;
         for (Row ignored : data.readRows(Query.create(TableId.of(TABLE)))) {

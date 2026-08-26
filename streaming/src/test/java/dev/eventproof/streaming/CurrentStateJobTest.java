@@ -1,6 +1,7 @@
 package dev.eventproof.streaming;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertThrows;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -107,6 +108,16 @@ public class CurrentStateJobTest {
         assertThrows(
                 JsonProcessingException.class,
                 () -> parser.map(line.replace("\"state\":", "\"unexpected\":1,\"state\":")));
+    }
+
+    @Test
+    public void rowKeySeparatorCannotCollideAcrossEntityTypeAndId() {
+        assertEquals(
+                "resource#resource-0000",
+                CurrentStateRow.rowKey("resource", "resource-0000"));
+        // Without escaping both of these would be "a#b#c".
+        assertNotEquals(
+                CurrentStateRow.rowKey("a#b", "c"), CurrentStateRow.rowKey("a", "b#c"));
     }
 
     private static String lineWithSequence(String sequenceField) {

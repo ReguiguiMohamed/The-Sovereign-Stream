@@ -81,11 +81,15 @@ deterministic generator (NDJSON)
   last. Proved twice — through the Bigtable client alone, and end to end through
   the Flink sink. The emulator is in-memory, so this proves the data contract and
   materialization semantics, not durability across a restart.
-- CI reproducing the Python, Flink and Bigtable emulator gates on every push.
+- A bounded local query API: `GET /v1/current-state?entity_type=&entity_id=`
+  answers from exactly one Bigtable point read on the JDK HTTP server, with no
+  scan, listing or pagination. Loopback-only and unauthenticated, so it is a proof
+  of the query path rather than a deployable service.
+- CI reproducing the Python, Flink, Bigtable emulator and query API gates on
+  every push.
 
 ## Next
 
-- Serve one entity through a bounded query API.
 - Checkpointing with restart and recovery tests, plus accepted, suppressed and
   late counters.
 - Container images for the streaming job and the query API.
@@ -131,8 +135,8 @@ generated manifest.
 | --- | --- |
 | [`contracts/`](contracts/) | Versioned event schemas |
 | [`eventproof/`](eventproof/README.md) | Event model and deterministic scenario generator |
-| [`streaming/`](streaming/README.md) | Flink current-state job and MiniCluster tests |
-| [`apps/`](apps/README.md) | External adapter and bounded query API |
+| [`streaming/`](streaming/README.md) | Flink current-state job, Bigtable materialization and the query API |
+| [`apps/`](apps/README.md) | Future external-event adapter |
 | [`infra/`](infra/README.md) | Terraform roots |
 | [`docs/`](docs/) | Architecture decision, delivery plan and backlog |
 
