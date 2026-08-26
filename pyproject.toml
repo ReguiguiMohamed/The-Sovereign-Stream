@@ -5,6 +5,9 @@ description = "Prospect-neutral operational event reliability proof for GCP"
 requires-python = ">=3.12"
 license = { text = "MIT" }
 
+[tool.setuptools]
+packages = ["eventproof"]
+
 [project.optional-dependencies]
 test = ["jsonschema>=4.23,<5"]
 
