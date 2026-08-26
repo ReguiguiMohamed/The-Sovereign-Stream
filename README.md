@@ -74,12 +74,18 @@ deterministic generator (NDJSON)
   newest-wins current-state emission.
 - MiniCluster tests proving both invariants, and a generator-to-Flink run whose
   output matches the manifest.
-- CI reproducing the Python and Flink gates on every push.
+- Bigtable current-state materialization against the official emulator: one row
+  per entity, the whole event stored as a JSON cell timestamped with its
+  `event_time` under `maxVersions(1)`, so a mutation carrying an older
+  `event_time` cannot become the visible current value even when it is written
+  last. Proved twice — through the Bigtable client alone, and end to end through
+  the Flink sink. The emulator is in-memory, so this proves the data contract and
+  materialization semantics, not durability across a restart.
+- CI reproducing the Python, Flink and Bigtable emulator gates on every push.
 
 ## Next
 
-- Materialize current state into the Bigtable emulator, then serve one entity
-  through a bounded query API.
+- Serve one entity through a bounded query API.
 - Checkpointing with restart and recovery tests, plus accepted, suppressed and
   late counters.
 - Container images for the streaming job and the query API.
