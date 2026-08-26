@@ -1,8 +1,8 @@
 # The Sovereign Stream
 
 Operational event streams redeliver and reorder. This repository proves a stream
-processor handles both correctly, and shows the evidence, on a production-shaped
-Google Cloud architecture.
+processor handles both correctly, on a production-shaped Google Cloud
+architecture.
 
 Code namespace: `eventproof`.
 
@@ -10,19 +10,16 @@ Code namespace: `eventproof`.
 
 Any at-least-once pipeline eventually delivers the same event twice, and any
 distributed producer eventually delivers an older event after a newer one. Most
-streaming demonstrations sidestep both by measuring throughput on clean, ordered
-input. Correctness under redelivery and reordering is what actually breaks
-systems in production, so that is what this project measures.
+streaming demonstrations measure throughput on clean, ordered input. This one
+measures correctness under redelivery and reordering.
 
 ## The two invariants
-
-The project exists to hold these under automated test:
 
 1. **An exact redelivery is acknowledged but never applied twice.** A duplicate
    event produces no second current-state update.
 2. **A late event never overwrites newer state.** An event whose `event_time` is
    120 seconds older than the entity's current state is accepted as delivered,
-   but the newer state stands.
+   and the newer state stands.
 
 Both are evaluated per entity, from deterministic input, with the expected result
 recorded in a manifest before the stream processor runs.
@@ -30,13 +27,9 @@ recorded in a manifest before the stream processor runs.
 ## Approach
 
 Correctness first, infrastructure second. State transitions are proved in a local
-Flink MiniCluster against a deterministic generator before any broker, container
-or cloud resource is introduced. Ingestion plumbing cannot conceal a wrong state
-transition when the transition is already under test.
-
-Every claim carries an explicit boundary: designed only, implemented locally,
-tested locally, or executed in GCP. Nothing is described as working in the cloud
-until it has run there and produced timestamped evidence.
+Flink MiniCluster against deterministic input before a broker, container or cloud
+resource enters the picture: a wrong transition is easiest to catch when nothing
+else can hide it.
 
 ## Architecture
 
@@ -51,9 +44,10 @@ event source
 ```
 
 GCS holds checkpoints and savepoints, Managed Prometheus holds runtime metrics,
-and Terraform defines every resource.
+and Terraform defines every resource. Kafka ingestion is exercised against
+Managed Service for Apache Kafka inside a time-capped evidence window.
 
-Local path, which is free, needs no broker, and gates every cloud step:
+Local path, which gates every cloud step:
 
 ```text
 deterministic generator (NDJSON)
@@ -62,24 +56,31 @@ deterministic generator (NDJSON)
   -> bounded local query API
 ```
 
-Kafka is integrated in exactly one place: Google Cloud Managed Service for Apache
-Kafka, during a controlled, time-capped evidence window. There is no local broker.
+## Done
 
-## Status
+- `operational-state.v1` contract with canonical JSON encoding and SHA-256 event
+  identity.
+- Deterministic generator producing baseline, exact-duplicate and 120-second-late
+  scenarios, plus a verification manifest recording expected current state per
+  entity.
+- Apache Flink 2.2.1 job on JDK 17: NDJSON parsing, keyed per-entity state and
+  newest-wins current-state emission.
+- MiniCluster tests proving both invariants, and a generator-to-Flink run whose
+  output matches the manifest.
+- CI reproducing the Python and Flink gates on every push.
 
-| Capability | Boundary |
-| --- | --- |
-| `operational-state.v1` contract and canonical encoding | Tested locally |
-| Deterministic baseline, duplicate and late-120s scenarios | Tested locally |
-| Flink current-state job with keyed newest-wins state | Tested locally |
-| Duplicate suppression and per-entity late-state preservation | Tested locally |
-| Bigtable materialization and bounded query API | Designed only |
-| Checkpoint and restart recovery, metrics, containers | Designed only |
-| Managed Kafka, GKE, Cloud Run and Terraform resources | Designed only |
-| Every component above, in Google Cloud | Not executed in GCP |
+## Next
 
-No GCP resource has been created by this repository. No exactly-once processing,
-production readiness or cloud validation is claimed.
+- Materialize current state into the Bigtable emulator, then serve one entity
+  through a bounded query API.
+- Checkpointing with restart and recovery tests, plus accepted, suppressed and
+  late counters.
+- Container images for the streaming job and the query API.
+- Terraform for identity, network, retained storage and time-capped compute.
+- Managed Kafka ingestion and replay, exercised in a GCP evidence window.
+
+Sequencing and cost gates are in [`docs/end-to-end-plan.md`](docs/end-to-end-plan.md);
+the item-level breakdown is in [`docs/backlog.md`](docs/backlog.md).
 
 ## Quick start
 
@@ -118,9 +119,6 @@ generated manifest.
 | [`apps/`](apps/README.md) | External adapter and bounded query API |
 | [`infra/`](infra/README.md) | Terraform roots |
 | [`docs/`](docs/) | Architecture decision, delivery plan and backlog |
-
-The delivery sequence, cost gates and truth boundaries are in
-[`docs/end-to-end-plan.md`](docs/end-to-end-plan.md).
 
 ## License
 
