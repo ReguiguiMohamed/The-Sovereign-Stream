@@ -89,7 +89,10 @@ deterministic generator (NDJSON)
 - Checkpointing with restart and recovery tests, plus accepted, suppressed and
   late counters.
 - Container images for the streaming job and the query API.
-- Terraform for identity, network, retained storage and time-capped compute.
+- Terraform covering the three resource classes: bootstrap control plane,
+  evidence-window data plane and an explicitly approved retained set that is empty
+  by default. Bigtable, Kafka and GCS belong to the evidence window and are
+  destroyed with it.
 - Managed Kafka ingestion and replay, exercised in a GCP evidence window.
 
 Sequencing and cost gates are in [`docs/end-to-end-plan.md`](docs/end-to-end-plan.md);

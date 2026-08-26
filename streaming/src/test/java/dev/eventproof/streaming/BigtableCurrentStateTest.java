@@ -126,6 +126,44 @@ public class BigtableCurrentStateTest {
         assertEquals(1, rowCount());
     }
 
+    /**
+     * Bigtable creates tables with MILLIS granularity and rejects a cell timestamp
+     * that is not a whole millisecond, so the cell version resolves to exactly one
+     * millisecond. This locks both halves of that: sub-millisecond detail is lost,
+     * and one millisecond of difference still orders two events.
+     */
+    @Test
+    public void cellVersionIsAWholeMillisecondAndOrdersAtThatResolution() throws Exception {
+        OperationalStateEvent newer =
+                event("a".repeat(64), 0, "2026-08-25T00:00:00.002000Z", "completed");
+        OperationalStateEvent sameMillisecond =
+                event("b".repeat(64), 1, "2026-08-25T00:00:00.002999Z", "processing");
+        OperationalStateEvent olderMillisecond =
+                event("c".repeat(64), 2, "2026-08-25T00:00:00.001000Z", "processing");
+
+        // The known limit: 999 microseconds of difference collapse onto one cell.
+        assertEquals(
+                CurrentStateRow.cellTimestampMicros(newer),
+                CurrentStateRow.cellTimestampMicros(sameMillisecond));
+        // One millisecond of difference survives, and the value stays millisecond
+        // aligned so Bigtable accepts it.
+        assertEquals(
+                1_000L,
+                CurrentStateRow.cellTimestampMicros(newer)
+                        - CurrentStateRow.cellTimestampMicros(olderMillisecond));
+        assertEquals(0L, CurrentStateRow.cellTimestampMicros(newer) % 1_000L);
+
+        data.mutateRow(CurrentStateRow.mutation(TABLE, newer));
+        data.mutateRow(CurrentStateRow.mutation(TABLE, olderMillisecond));
+
+        OperationalStateEvent current =
+                CurrentStateRow.read(data, TABLE, ENTITY_TYPE, ENTITY_ID);
+
+        assertNotNull(current);
+        assertEquals(newer.getEventId(), current.getEventId());
+        assertEquals("completed", current.getState());
+    }
+
     @Test
     public void rowKeySeparatorCannotCollideAcrossEntityTypeAndId() {
         assertEquals(

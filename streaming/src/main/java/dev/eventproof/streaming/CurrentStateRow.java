@@ -1,14 +1,14 @@
 package dev.eventproof.streaming;
 
+import static com.google.cloud.bigtable.data.v2.models.Filters.FILTERS;
+
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.google.cloud.bigtable.data.v2.BigtableDataClient;
+import com.google.cloud.bigtable.data.v2.models.Filters.Filter;
 import com.google.cloud.bigtable.data.v2.models.Row;
-import com.google.cloud.bigtable.data.v2.models.RowCell;
 import com.google.cloud.bigtable.data.v2.models.RowMutation;
 import com.google.cloud.bigtable.data.v2.models.TableId;
 import java.time.Instant;
-import java.util.Comparator;
-import java.util.List;
 
 /**
  * The Bigtable current-state row contract, described in
@@ -20,6 +20,12 @@ import java.util.List;
 final class CurrentStateRow {
     static final String COLUMN_FAMILY = "cs";
     static final String EVENT_QUALIFIER = "event";
+
+    /** Narrows the point read to the newest version of the one cell we store. */
+    private static final Filter NEWEST_EVENT_CELL = FILTERS.chain()
+            .filter(FILTERS.family().exactMatch(COLUMN_FAMILY))
+            .filter(FILTERS.qualifier().exactMatch(EVENT_QUALIFIER))
+            .filter(FILTERS.limit().cellsPerColumn(1));
 
     private CurrentStateRow() {}
 
@@ -49,28 +55,29 @@ final class CurrentStateRow {
     /**
      * The cell version is the event's own time, never arrival time: arrival time
      * would let a late delivery become the newest cell.
+     *
+     * <p>Bigtable expresses timestamps in microseconds but creates tables with
+     * MILLIS granularity and rejects any value that is not a whole millisecond, so
+     * the sub-millisecond part is dropped here rather than at write time. Two
+     * events inside one millisecond therefore share a cell and cannot be ordered
+     * by storage.
      */
     static long cellTimestampMicros(OperationalStateEvent event) {
-        return Instant.parse(event.getEventTime()).toEpochMilli() * 1000L;
+        Instant eventTime = Instant.parse(event.getEventTime());
+        return Math.addExact(
+                Math.multiplyExact(eventTime.getEpochSecond(), 1_000_000L),
+                (eventTime.getNano() / 1_000_000) * 1_000L);
     }
 
     /** Returns the current event for one entity, or null when the row is absent. */
     static OperationalStateEvent read(
             BigtableDataClient client, String tableId, String entityType, String entityId)
             throws JsonProcessingException {
-        Row row = client.readRow(TableId.of(tableId), rowKey(entityType, entityId));
-        if (row == null) {
+        Row row = client.readRow(
+                TableId.of(tableId), rowKey(entityType, entityId), NEWEST_EVENT_CELL);
+        if (row == null || row.getCells().isEmpty()) {
             return null;
         }
-        List<RowCell> cells = row.getCells(COLUMN_FAMILY, EVENT_QUALIFIER);
-        if (cells.isEmpty()) {
-            return null;
-        }
-        // maxVersions(1) is collected asynchronously, so an older cell can still be
-        // present. Pick the newest by timestamp rather than trusting collection.
-        RowCell newest = cells.stream()
-                .max(Comparator.comparingLong(RowCell::getTimestamp))
-                .orElseThrow();
-        return EventJson.read(newest.getValue().toStringUtf8());
+        return EventJson.read(row.getCells().get(0).getValue().toStringUtf8());
     }
 }

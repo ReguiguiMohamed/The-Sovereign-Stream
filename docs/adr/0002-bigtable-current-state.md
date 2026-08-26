@@ -21,8 +21,8 @@ so the schema is designed for one row read and nothing else.
 | Row key | `escape(entity_type) + "#" + escape(entity_id)` |
 | Column family | `cs` |
 | Qualifier | `event` |
-| Cell value | the complete `operational-state.v1` event as canonical JSON |
-| Cell timestamp | the event's `event_time` in microseconds since the epoch |
+| Cell value | the complete `operational-state.v1` event as contract JSON |
+| Cell timestamp | the event's `event_time`, as microseconds truncated to a whole millisecond |
 | Garbage collection | `maxVersions(1)` |
 
 ### Row key
@@ -42,8 +42,11 @@ has not measured.
 
 The whole event is stored as one JSON cell rather than spread across a column per
 field, because the bounded query reads the whole event together. It is written
-with the same `EventJson` mapper the parser uses, so stored JSON keeps the
+with the same `EventJson` mapper the parser uses, so the stored JSON keeps the
 snake_case contract field names and reads back into the same type.
+`EventJson` is Jackson configured for that contract; it is not the canonical-JSON
+algorithm in `eventproof/event.py`, which is what produces the SHA-256 `event_id`,
+and the two are not interchangeable.
 
 ### Cell timestamp and write semantics
 
@@ -53,8 +56,17 @@ the newest write win, which is the failure this project exists to prevent.
 With `maxVersions(1)` and event-time cell timestamps, a mutation carrying an
 older `event_time` writes an older cell version and cannot become the newest
 cell, no matter when it arrives. Garbage collection is asynchronous, so an older
-cell may still be present after a newer one is written; reads therefore select
-the newest cell explicitly rather than trusting collection to have run.
+cell may still be present after a newer one is written. The point read therefore
+does not trust collection to have run: it applies a server-side filter chain of
+family `cs`, qualifier `event` and `cellsPerColumn(1)`, so Bigtable returns only
+the newest cell and the client deserializes exactly one value.
+
+Bigtable expresses cell timestamps in microseconds, but a table is created with
+MILLIS granularity and the service rejects any timestamp that is not a whole
+millisecond. The Java admin client exposes no granularity setting, so the
+effective resolution is one millisecond: `cellTimestampMicros` truncates there
+deliberately. Two events inside the same millisecond collapse onto one cell and
+storage cannot order them.
 
 Writes are idempotent: row key, qualifier and cell timestamp are all derived from
 the event, so writing the same event twice produces the same single cell. This is
@@ -78,6 +90,10 @@ evidence window.
   identical cell timestamp would overwrite the first. This is a recorded contract
   limit, not a designed total ordering; defining one is deferred until a real
   workload shows equal timestamps occur.
+- Cell versions resolve to one millisecond, not one microsecond. Two events for
+  one entity inside the same millisecond share a cell, and the later write wins
+  regardless of which has the newer `event_time`. Sub-millisecond ordering would
+  need a different cell layout, and no observed workload calls for one.
 - Throughput, row-key distribution and hotspot behaviour are unmeasured. A
   workload-specific key distribution decision waits for production-shaped data.
 - One synchronous mutation per record. Batching is deferred to a measurement.
