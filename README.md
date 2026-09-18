@@ -43,7 +43,12 @@ report an assertion failure when the defect is put back.
 - [Cloud Build pipeline](cloudbuild.yaml): tests, shaded jar, both images, and a
   smoke test of the packaged images against live Jetstream.
 - Terraform evidence root and the scheduled, verified teardown it is pinned to.
-- Operator install and workload manifests for GKE ([deploy](deploy/)).
+- Operator install and workload manifests for GKE, with a deployment
+  [acceptance check](deploy/accept.sh): a running job, a checkpoint in the real
+  bucket, recovery from it after the TaskManager is deleted, and an
+  authenticated API answer confirmed against the record at the source.
+- Runbook for the recorded Console walkthrough
+  ([demo-runbook.md](docs/demo-runbook.md)); the recording itself is still to do.
 - [Jetstream sample](tools/jetstream-sample.yaml) and
   [cost estimate](docs/cost-estimate.md) from measured traffic.
 

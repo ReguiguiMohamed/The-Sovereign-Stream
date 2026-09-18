@@ -100,6 +100,33 @@
         <artifactId>maven-surefire-plugin</artifactId>
         <version>3.5.4</version>
       </plugin>
+      <!-- The producer and the API carry an SLF4J binding, so the Kafka and
+           Bigtable client warnings are recorded instead of dropped. It stays
+           out of the shaded jar: the Flink image has its own binding. -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-dependency-plugin</artifactId>
+        <version>3.8.1</version>
+        <executions>
+          <execution>
+            <phase>package</phase>
+            <goals>
+              <goal>copy</goal>
+            </goals>
+            <configuration>
+              <outputDirectory>${project.build.directory}/service-lib</outputDirectory>
+              <stripVersion>true</stripVersion>
+              <artifactItems>
+                <artifactItem>
+                  <groupId>org.slf4j</groupId>
+                  <artifactId>slf4j-simple</artifactId>
+                  <version>1.7.36</version>
+                </artifactItem>
+              </artifactItems>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
       <!-- One jar for the Flink job, the producer and the API. -->
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>

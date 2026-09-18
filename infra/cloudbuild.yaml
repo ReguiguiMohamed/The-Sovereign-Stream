@@ -2,8 +2,8 @@
 #   bundle   evidence only: upload the teardown bundle (config, lock, variables,
 #            teardown script) to the versioned state bucket and print its generation
 #   plan     fmt, validate and a saved plan
-#   apply    plan, then apply; an evidence apply first proves the pinned teardown
-#            bundle matches this configuration and the window is still open
+#   apply    plan, then apply; an evidence apply first proves the live teardown
+#            schedule will destroy this configuration and the window is still open
 #   destroy  plan -destroy, then apply
 # Run from the repository root, for example:
 #   gcloud builds submit --config=infra/cloudbuild.yaml --region=europe-west1 \
@@ -30,17 +30,18 @@ steps:
           exit 0
         fi
         [ "${_ACTION}" = apply ] || exit 0
-        gcloud storage cat gs://${PROJECT_ID}-tfstate/control/default.tfstate > /tmp/control.json
-        read -r window_end generation < <(python3 -c "import json; o=json.load(open('/tmp/control.json'))['outputs']; print(o['window_end']['value'], o['bundle_generation']['value'])")
-        # Apply only with at least 30 minutes left before the scheduled teardown.
-        if [ "$$(date -u +%s)" -gt "$$(( $$(date -u -d "$$window_end" +%s) - 1800 ))" ]; then
-          echo "window ends $$window_end: refusing to apply"; exit 1
-        fi
+        # The live schedule decides, not the saved outputs: it is what will
+        # actually destroy whatever this apply creates.
+        gcloud storage cat gs://${PROJECT_ID}-tfstate/control/default.tfstate > /tmp/control.json 2>/dev/null || echo "{}" > /tmp/control.json
+        gcloud scheduler jobs describe evidence-teardown --project=${PROJECT_ID} --location=${_REGION} --format=json > /tmp/job.json 2>/dev/null || : > /tmp/job.json
+        PYTHONPATH=infra python3 infra/test_window_guard.py
+        python3 infra/window_guard.py /tmp/control.json /tmp/job.json > /tmp/window.txt
+        read -r window_end generation < /tmp/window.txt
         gcloud storage cp "$$bundle#$$generation" /tmp/pinned.tgz
         mkdir /tmp/pinned && tar xzf /tmp/pinned.tgz -C /tmp/pinned
         diff -r --exclude=.terraform /tmp/pinned/infra/evidence infra/evidence
         diff /tmp/pinned/infra/teardown.sh infra/teardown.sh
-        echo "pinned teardown bundle $$generation matches; window ends $$window_end"
+        echo "teardown scheduled from bundle $$generation; window ends $$window_end"
 
   - id: terraform
     name: hashicorp/terraform:1.16.3@sha256:c9a9d991c113f3bda5269de1506983d45ce1409dfe702df433acf10a5ea9f6bc
@@ -82,6 +83,7 @@ steps:
 substitutions:
   _ROOT: evidence
   _ACTION: plan
+  _REGION: europe-west1
   _TFVARS: ""
 logsBucket: gs://${PROJECT_ID}-build-source/logs
 timeout: 3600s

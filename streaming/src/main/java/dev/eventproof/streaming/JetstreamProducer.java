@@ -6,6 +6,7 @@ import dev.eventproof.streaming.TransactionalPublisher.Received;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.WebSocket;
+import java.net.http.WebSocketHandshakeException;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -36,8 +37,10 @@ import org.apache.kafka.common.serialization.StringSerializer;
  * downstream by its revision.
  */
 public final class JetstreamProducer {
-    static final String ENDPOINT =
-            "wss://jetstream.us-east.bsky.network/xrpc/network.bsky.jetstream.subscribeEvents";
+    /** The public Jetstream instances; one is tried per connection attempt. */
+    static final List<String> ENDPOINTS = List.of(
+            "wss://jetstream.us-east.bsky.network/xrpc/network.bsky.jetstream.subscribeEvents",
+            "wss://jetstream.us-west.bsky.network/xrpc/network.bsky.jetstream.subscribeEvents");
     private static final String USER_AGENT =
             "eventproof (+https://github.com/ReguiguiMohamed/The-Sovereign-Stream)";
     private static final int MAX_CONSECUTIVE_FAILURES = 10;
@@ -47,11 +50,12 @@ public final class JetstreamProducer {
 
     private JetstreamProducer() {}
 
-    static String url(long cursor) {
+    static String url(long cursor, int attempt) {
         String collections = JetstreamMapping.COLLECTIONS.stream()
                 .map(collection -> "collections=" + collection)
                 .collect(Collectors.joining("&"));
-        return ENDPOINT + "?" + collections + (cursor < 0 ? "" : "&cursor=" + cursor);
+        return ENDPOINTS.get(Math.floorMod(attempt, ENDPOINTS.size()))
+                + "?" + collections + (cursor < 0 ? "" : "&cursor=" + cursor);
     }
 
     public static void main(String[] args) throws Exception {
@@ -79,6 +83,10 @@ public final class JetstreamProducer {
             producer.initTransactions();
             TransactionalPublisher publisher =
                     new TransactionalPublisher(producer, topic, quarantineTopic);
+            // The counters at the moment the container is stopped, so a run can
+            // be compared with what the topic actually holds.
+            Runtime.getRuntime().addShutdownHook(
+                    new Thread(() -> logStats(publisher, cursor.get())));
             ScheduledExecutorService stats = Executors.newSingleThreadScheduledExecutor(
                     runnable -> {
                         Thread thread = new Thread(runnable, "stats");
@@ -103,7 +111,7 @@ public final class JetstreamProducer {
             try {
                 socket = http.newWebSocketBuilder()
                         .header("User-Agent", USER_AGENT)
-                        .buildAsync(URI.create(url(cursor.get())), session)
+                        .buildAsync(URI.create(url(cursor.get(), failures)), session)
                         .join();
                 List<Received> batch = new ArrayList<>();
                 while (!session.closed.isDone() || !session.queue.isEmpty()) {
@@ -120,7 +128,11 @@ public final class JetstreamProducer {
                 System.err.println("jetstream closed: "
                         + session.closed.handle((ignored, error) -> error).join());
             } catch (CompletionException connectFailure) {
-                System.err.println("jetstream connection failed: " + connectFailure.getCause());
+                // A refused handshake carries its status only in the response.
+                Throwable cause = connectFailure.getCause();
+                System.err.println("jetstream connection failed: "
+                        + (cause instanceof WebSocketHandshakeException refused
+                                ? "HTTP " + refused.getResponse().statusCode() : cause));
             } finally {
                 if (socket != null) {
                     socket.abort();
@@ -133,7 +145,8 @@ public final class JetstreamProducer {
                 throw new IllegalStateException(
                         "jetstream unavailable after " + MAX_CONSECUTIVE_FAILURES + " attempts");
             }
-            System.err.println("reconnecting from cursor " + cursor.get());
+            System.err.println("reconnecting from cursor " + cursor.get() + " to "
+                    + ENDPOINTS.get(Math.floorMod(failures, ENDPOINTS.size())));
             Thread.sleep(Math.min(60_000L, 1_000L << failures));
         }
     }

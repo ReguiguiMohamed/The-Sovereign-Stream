@@ -94,6 +94,11 @@ resource "google_cloud_scheduler_job" "teardown" {
   region    = var.region
   schedule  = "*/15 * * * *"
   time_zone = "Etc/UTC"
+  # A verified teardown pauses this job. Reopening a window applies the control
+  # root again, which resumes it; the evidence guard refuses to apply while it
+  # is paused. The deadline covers submitting the build, not running it.
+  paused           = false
+  attempt_deadline = "180s"
 
   http_target {
     http_method = "POST"
@@ -120,10 +125,18 @@ resource "google_monitoring_alert_policy" "teardown_failed" {
   combiner              = "OR"
   notification_channels = [google_monitoring_notification_channel.owner.id]
 
+  # One condition: a log-based policy may hold only one. Each clause is a
+  # failure no other clause sees.
   conditions {
-    display_name = "teardown error logged"
+    display_name = "teardown failed, was not dispatched, or its build did not succeed"
     condition_matched_log {
-      filter = "logName=\"projects/${var.project_id}/logs/eventproof-teardown\" AND severity>=ERROR"
+      filter = <<-EOT
+        severity>=ERROR AND (
+          logName="projects/${var.project_id}/logs/eventproof-teardown"
+          OR (resource.type="cloud_scheduler_job" AND resource.labels.job_id="${google_cloud_scheduler_job.teardown.name}")
+          OR (resource.type="build" AND operation.last=true AND protoPayload.authenticationInfo.principalEmail="${local.scheduler_account}")
+        )
+      EOT
     }
   }
 

@@ -5,6 +5,19 @@
 #     --gcs-source-staging-dir=gs://eventproof-stream-2609-build-source/source \
 #     --service-account=projects/eventproof-stream-2609/serviceAccounts/cloud-build@eventproof-stream-2609.iam.gserviceaccount.com
 steps:
+  # The checks that guard a window and accept a deployment, run here too, so a
+  # break in them is found before a window is open rather than inside one.
+  - id: checks
+    name: gcr.io/cloud-builders/gcloud
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -e
+        bash -n tools/image-smoke.sh deploy/accept.sh infra/teardown.sh infra/bootstrap.sh
+        PYTHONPATH=infra python3 infra/test_window_guard.py
+        PYTHONPATH=deploy python3 -c "import record_trace, recovery_check; record_trace.self_check(); recovery_check.self_check(); print('deploy checks hold')"
+
   - id: verify
     name: maven:3.9.11-eclipse-temurin-17@sha256:e4a7ace3dc0d645ed97f8d9ad0b0d3f0b14fa8d150138f27f116d7105a639b82
     entrypoint: mvn

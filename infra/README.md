@@ -24,6 +24,17 @@ deployment identity one role per stated purpose, and creates the gross-cost
 budget alerts. It is owner-run and rerunnable, so Terraform never holds
 project-wide policy control.
 
+Two of its grants are easy to get wrong and are called out in the script:
+`cloud-build` needs `roles/iam.serviceAccountUser` **on** `teardown-scheduler`
+to attach that identity to the Scheduler job, as well as the reverse binding
+that lets the dispatcher submit builds as `cloud-build`; and the checkpoint
+bucket's conditional `roles/storage.admin` must leave bucket creation granted,
+since that call is authorised on the project and the project carries no bucket
+`resource.name`.
+
+The evidence root's `api_invokers` must include the `cloud-build` identity: the
+deploy build calls the private API as itself to accept the deployment.
+
 ## Retained resources
 
 Destroyed only by an explicit decision, never by the scheduled teardown:
@@ -51,13 +62,32 @@ with state in the bootstrap bucket.
 2. The control root pins that generation and the window end, and schedules a
    build every 15 minutes.
 3. An evidence apply refuses to run unless the pinned bundle matches the
-   configuration being applied and at least 30 minutes of the window remain.
+   configuration being applied, at least 30 minutes of the window remain, and
+   the Scheduler job that exists right now would destroy it:
+   [`window_guard.py`](window_guard.py) compares the live job with the control
+   configuration that declared it, down to the build body, the pinned bundle
+   generation and the dispatch identity, and refuses a missing, paused or
+   mismatched schedule. A teardown pauses that job when it verifies; reopening a
+   window applies the control root again, which resumes it.
+   [`test_window_guard.py`](test_window_guard.py) holds each refusal and runs in
+   the guard step before the guard is trusted.
 4. Each scheduled run skips while the window is open or another teardown is
    running, then destroys, then verifies that no cluster, Kafka cluster, Cloud
    Run service, router, network, table or checkpoint bucket remains. It retries
    every 15 minutes until that verification passes, then pauses itself.
-5. Any failure is logged to `eventproof-teardown` at ERROR, which alerts by
-   e-mail.
+5. Three log conditions alert the owner by e-mail, because no Google metric
+   reports either a Scheduler dispatch or a build's verdict:
+   - what the teardown reports itself, in log `eventproof-teardown` at ERROR;
+   - a failed dispatch, on the `cloud_scheduler_job` resource at ERROR, for a
+     run that never reached Cloud Build;
+   - Cloud Build's own terminal audit entry for a teardown build, which covers
+     the failures no step of ours can report: source fetch, a failing gate, a
+     timeout. Failed build `770d4aaa-48e0-42ce-9109-8ce4cb2f9aa6` shows the
+     shape this matches: `resource.type="build"`, `operation.last=true`,
+     `severity=ERROR`.
+
+   The dispatch and build conditions are verified against the live services only
+   once the control root has been applied.
 
 The bundle is complete before the first apply, so a partial apply is still
 covered by a teardown that destroys exactly the configuration that was applied.

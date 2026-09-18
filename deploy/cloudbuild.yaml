@@ -1,5 +1,5 @@
-# Installs the Flink Kubernetes Operator and applies the workloads, using the
-# evidence Terraform outputs. Run after an evidence apply:
+# Installs the Flink Kubernetes Operator, applies the workloads and accepts the
+# result, using the evidence Terraform outputs. Run after an evidence apply:
 #   gcloud builds submit --config=deploy/cloudbuild.yaml ... \
 #     --substitutions=_SERVICE_IMAGE=<digest ref>,_FLINK_IMAGE=<digest ref>
 steps:
@@ -51,10 +51,17 @@ steps:
           < deploy/workloads.yaml | kubectl apply -f -
         kubectl -n eventproof rollout status deployment/jetstream-producer --timeout=300s
 
+  # Nothing is deployed until it is accepted; see deploy/accept.sh.
+  - id: accept
+    name: gcr.io/cloud-builders/gcloud
+    entrypoint: bash
+    args: [deploy/accept.sh]
+    env: ["PROJECT_ID=${PROJECT_ID}"]
+
 substitutions:
   _SERVICE_IMAGE: ""
   _FLINK_IMAGE: ""
 logsBucket: gs://${PROJECT_ID}-build-source/logs
-timeout: 1800s
+timeout: 3600s
 options:
   logging: GCS_ONLY

@@ -9,5 +9,6 @@ COPY target/eventproof-streaming.jar /opt/flink/usrlib/eventproof-streaming.jar
 # Producer and query API: the main class is the container argument.
 FROM eclipse-temurin:17-jre-noble@sha256:4e04629bf268320c6b33d178ebebe0d830bf7ddd141b12e6100006f979621b9a AS service
 COPY target/eventproof-streaming.jar /app/eventproof-streaming.jar
+COPY target/service-lib/slf4j-simple.jar /app/lib/slf4j-simple.jar
 USER 65532
-ENTRYPOINT ["java", "-XX:MaxRAMPercentage=75", "-cp", "/app/eventproof-streaming.jar"]
+ENTRYPOINT ["java", "-XX:MaxRAMPercentage=75", "-Dorg.slf4j.simpleLogger.defaultLogLevel=warn", "-Dorg.slf4j.simpleLogger.showDateTime=true", "-Dorg.slf4j.simpleLogger.dateTimeFormat=yyyy-MM-dd HH:mm:ss.SSS", "-cp", "/app/eventproof-streaming.jar:/app/lib/*"]

@@ -2,6 +2,7 @@ package dev.eventproof.streaming;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
@@ -108,8 +109,11 @@ public class TransactionalPublisherTest {
         consumer.updateEndOffsets(Map.of(partition, 0L));
 
         assertEquals(-1, TransactionalPublisher.lastCommittedSeq(consumer, TOPIC));
-        assertEquals(-1, JetstreamProducer.url(-1).indexOf("cursor="));
-        assertTrue(JetstreamProducer.url(205).endsWith("&cursor=205"));
+        assertEquals(-1, JetstreamProducer.url(-1, 0).indexOf("cursor="));
+        assertTrue(JetstreamProducer.url(205, 0).endsWith("&cursor=205"));
+        // A refused instance is not retried: the next attempt is another one.
+        assertNotEquals(JetstreamProducer.url(205, 0), JetstreamProducer.url(205, 1));
+        assertEquals(JetstreamProducer.url(205, 0), JetstreamProducer.url(205, 2));
     }
 
     private static MockProducer<String, String> producer() {

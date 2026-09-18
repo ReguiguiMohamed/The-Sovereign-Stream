@@ -50,6 +50,10 @@ gcloud bigtable instances add-iam-policy-binding "$BIGTABLE_INSTANCE" --project=
 # Teardown dispatcher: submits the teardown build, which runs as cloud-build.
 project_role "$(account teardown-scheduler)" roles/cloudbuild.builds.editor
 account_role "$BUILD" "$(account teardown-scheduler)" roles/iam.serviceAccountUser
+# Attaching that identity to the Scheduler job needs actAs on it, for the
+# identity that creates the job:
+# https://cloud.google.com/scheduler/docs/http-target-auth
+account_role "$(account teardown-scheduler)" $BUILD roles/iam.serviceAccountUser
 
 # Deployment identity, project level, one purpose each.
 project_role $BUILD roles/compute.networkAdmin                  # VPC, subnet, router, NAT
@@ -60,10 +64,13 @@ project_role $BUILD roles/cloudscheduler.admin                  # teardown job; 
 project_role $BUILD roles/cloudbuild.builds.viewer              # teardown overlap check
 project_role $BUILD roles/monitoring.alertPolicyEditor          # teardown failure alert
 project_role $BUILD roles/monitoring.notificationChannelEditor  # alert e-mail channel
-# Checkpoint bucket only.
+# Checkpoint bucket only. Creating a bucket is authorised on the project, which
+# provides no bucket resource.name, so a bare startsWith would deny the create.
+# The condition therefore restricts buckets and objects and leaves the rest of
+# the role, the shape the attribute reference prescribes.
 gcloud projects add-iam-policy-binding $P --member="serviceAccount:$BUILD" \
   --role=roles/storage.admin --format=none \
-  --condition="title=flink-bucket-only,expression=resource.name.startsWith('projects/_/buckets/$P-flink')"
+  --condition="title=flink-bucket-only,expression=(resource.type != 'storage.googleapis.com/Bucket' && resource.type != 'storage.googleapis.com/Object') || resource.name.startsWith('projects/_/buckets/$P-flink')"
 
 # Deployment identity, resource level.
 gcloud bigtable instances add-iam-policy-binding "$BIGTABLE_INSTANCE" --project=$P \
