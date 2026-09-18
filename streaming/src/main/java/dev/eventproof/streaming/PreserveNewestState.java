@@ -1,40 +1,43 @@
 package dev.eventproof.streaming;
 
-import java.time.Instant;
+import java.time.Duration;
 import org.apache.flink.api.common.functions.OpenContext;
+import org.apache.flink.api.common.state.StateTtlConfig;
 import org.apache.flink.api.common.state.ValueState;
 import org.apache.flink.api.common.state.ValueStateDescriptor;
 import org.apache.flink.streaming.api.functions.KeyedProcessFunction;
 import org.apache.flink.util.Collector;
 
-/** Emits only events that advance the materialized state for one entity. */
+/**
+ * Emits an event only when its revision is newer than the last one emitted for
+ * the same record.
+ *
+ * <p>Revisions are AT Protocol TIDs, which sort lexically in commit order, so the
+ * result does not depend on arrival order and a redelivered revision is dropped.
+ */
 public final class PreserveNewestState
-        extends KeyedProcessFunction<String, OperationalStateEvent, OperationalStateEvent> {
-    private transient ValueState<String> latestEventId;
-    private transient ValueState<Long> latestEventTime;
+        extends KeyedProcessFunction<String, RecordStateEvent, RecordStateEvent> {
+    private static final Duration STATE_TTL = Duration.ofDays(3);
+
+    private transient ValueState<String> latestRevision;
 
     @Override
     public void open(OpenContext ignored) {
-        latestEventId = getRuntimeContext().getState(
-                new ValueStateDescriptor<>("latest-event-id", String.class));
-        latestEventTime = getRuntimeContext().getState(
-                new ValueStateDescriptor<>("latest-event-time", Long.class));
+        ValueStateDescriptor<String> descriptor =
+                new ValueStateDescriptor<>("latest-revision", String.class);
+        // Bounded by topic retention; an older revision replayed after expiry is
+        // still kept from becoming current by the revision-ordered Bigtable cell.
+        descriptor.enableTimeToLive(StateTtlConfig.newBuilder(STATE_TTL).build());
+        latestRevision = getRuntimeContext().getState(descriptor);
     }
 
     @Override
     public void processElement(
-            OperationalStateEvent event,
-            Context ignored,
-            Collector<OperationalStateEvent> output) throws Exception {
-        if (event.getEventId().equals(latestEventId.value())) {
-            return;
-        }
-
-        long candidateTime = Instant.parse(event.getEventTime()).toEpochMilli();
-        Long currentTime = latestEventTime.value();
-        if (currentTime == null || candidateTime > currentTime) {
-            latestEventId.update(event.getEventId());
-            latestEventTime.update(candidateTime);
+            RecordStateEvent event, Context ignored, Collector<RecordStateEvent> output)
+            throws Exception {
+        String current = latestRevision.value();
+        if (current == null || event.revision.compareTo(current) > 0) {
+            latestRevision.update(event.revision);
             output.collect(event);
         }
     }

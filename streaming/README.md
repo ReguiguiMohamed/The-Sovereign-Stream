@@ -1,64 +1,100 @@
 # Streaming
 
-This directory contains one Apache Flink 2.2.1 application built with JDK 17.
+One Maven module on Flink 2.2.1 and JDK 17. It builds a single shaded jar with
+three entrypoints.
 
-- `OperationalStateEvent` mirrors the versioned neutral event contract.
-- `ParseOperationalState` maps one NDJSON line to that event type.
-- `PreserveNewestState` keeps Flink managed state per `entity_id` and emits an
-  update only when `event_time` is newer than the stored value.
-- `CurrentStateRow` is the Bigtable row contract: row key, column family, the
-  event JSON cell and its `event_time` cell timestamp.
-- `BigtableCurrentStateSink` writes accepted updates to Bigtable, one client per
-  sink writer.
-- `CurrentStateJobTest` runs the complete operator in a local MiniCluster.
-- `BigtableCurrentStateTest` runs the same operator into the official Bigtable
-  emulator, which the test starts in-process on a free port.
-- `CurrentStateApi` serves the bounded current-state lookup.
-- `CurrentStateApiTest` drives it over HTTP against the emulator.
+| Entrypoint | Runs on | Does |
+| --- | --- | --- |
+| `JetstreamProducer` | GKE | Reads Bluesky Jetstream v2 and publishes `record-state.v1` in Kafka transactions |
+| `CurrentStateJob` | Flink on GKE | Kafka topic → newest revision per record → Bigtable |
+| `CurrentStateApi` | Cloud Run | `GET /v1/current-state?entity_type=&entity_id=` |
 
-```bash
-mvn --batch-mode --file streaming/pom.xml verify
-```
+Only `CurrentStateJob` and `ParseRecordState` use Flink; the producer and the API
+run on a plain JRE.
 
-That single command runs everything, including the emulator tests: the emulator
-binary ships inside `google-cloud-bigtable-emulator`, so no Docker, no `gcloud`
-and no credentials are needed.
+## Record contract
 
-The duplicate test sends the same event twice and expects one current-state
-update. The late test sends `completed`, then a distinct `processing` event for
-the same entity with an `event_time` exactly 120 seconds older, and expects the
-single output to remain `completed`.
+[`contracts/record-state.v1.schema.json`](../contracts/record-state.v1.schema.json).
+One event is one revision of one record, or one account-level marker.
+
+| Field | Record | Account marker |
+| --- | --- | --- |
+| `entity_type` | `collection`: post, like or repost | `account` or `sync` |
+| `entity_id` | `did/rkey` | `did` |
+| `event_type` | `create`, `update`, `delete` | `account` or `sync` |
+| `state` | `active`, or `deleted` for a delete | `active`, the source status, or `resynced` |
+| `revision` | `rev`, the repository commit TID | the zero-padded `seq` |
+| `source_seq` | Jetstream `seq`, the resume cursor | same |
+| `subject` | the liked or reposted post URI, otherwise null | null |
+| `event_id` | SHA-256 of entity type, id, revision and event type | same |
+
+Record bodies are not kept. Identity events change no record and are counted,
+not published. Anything else malformed goes to the quarantine topic.
+
+## Ordering
+
+`escape(entity_type)#escape(entity_id)` keys Flink state and the Bigtable row.
+
+Flink emits a revision only when it sorts after the last one emitted for that
+record, so a redelivery is dropped and arrival order does not matter. Its state
+expires after 3 days, the topic retention.
+
+Storage does not depend on that. Every write is a check-and-mutate: Bigtable
+compares the stored revision with the new one and applies the mutation only when
+the new one is greater. Two revisions inside one millisecond, a batch retry, a
+cold replay and expired Flink state all converge on the newest revision.
+
+## Account lifecycle
+
+An account event with `active: false, status: deleted`, or a sync event, removes
+the account's earlier records: the account row's purge boundary is raised to that
+sequence, and each of the account's record rows whose sequence is at or below it
+is deleted, conditionally, so later records stay. A record read also checks the
+account row, so a record is hidden while the account is inactive and after a
+purge, even if a replay rewrites it.
+
+## Producer delivery
+
+- One Kafka transaction per batch. The batch commits only after every send in it
+  has succeeded, so a failed send cannot be passed by a later one.
+- The cursor is the highest committed sequence; on start it is read back from the
+  record topic with `read_committed`.
+- The Jetstream cursor is inclusive, so the boundary event is redelivered and
+  dropped by its revision.
+- The transactional id fences a previous instance, and any Kafka failure ends the
+  process; the restart resumes from the committed cursor.
+- One JSON stats line a minute: received, published, identity-skipped,
+  quarantined, cursor.
 
 ## Query API
 
-`CurrentStateApi` exposes exactly one endpoint on the JDK HTTP server:
-
-```text
-GET /v1/current-state?entity_type=<value>&entity_id=<value>
-```
-
 | Case | Response |
 | --- | --- |
-| entity present | `200`, the complete `operational-state.v1` event |
-| entity absent | `404 {"error":"not_found"}` |
+| record present and visible | `200`, the stored event |
+| absent, purged, or account inactive | `404 {"error":"not_found"}` |
 | missing, blank or repeated parameter | `400 {"error":"invalid_request"}` |
-| any method other than GET | `405 {"error":"method_not_allowed"}` with `Allow: GET` |
+| method other than GET | `405` with `Allow: GET` |
 
-Successful responses are `application/json; charset=utf-8`. Every request is one
-point read of one row: there is no scan, listing, pagination, mutation, health or
-admin endpoint, so query cost does not grow with the table. Failures return a
-fixed error body and never an exception message.
+One request reads at most two rows: the record and its account. The server uses
+16 workers, matching Cloud Run concurrency, and shuts down on SIGTERM. Access
+control is Cloud Run IAM.
 
-It binds to loopback and has no authentication, which is why it is a local proof
-and not a deployable service. Configuration comes from `BIGTABLE_PROJECT_ID`,
-`BIGTABLE_INSTANCE_ID`, `BIGTABLE_TABLE_ID`, `PORT` and, for local runs,
-`BIGTABLE_EMULATOR_HOST`.
+## Tests
 
-The Bigtable row contract is recorded in
-[`docs/adr/0002-bigtable-current-state.md`](../docs/adr/0002-bigtable-current-state.md).
-The emulator is in-memory, so these tests prove the data contract, the
-materialization semantics and the HTTP contract, not durability across a restart.
-No latency, throughput or cost has been measured.
+[`cloudbuild.yaml`](../cloudbuild.yaml) runs `mvn verify`, builds both images and
+then [`tools/image-smoke.sh`](../tools/image-smoke.sh), which runs the packaged
+images against live Jetstream, a Kafka broker and the Bigtable emulator, and
+restarts the producer to check its resume cursor.
 
-Kafka connectors are deliberately absent. Terraform and HTTP code do not belong
-here.
+- `CurrentStateJobTest`: redelivery, out-of-order revisions, delete convergence,
+  type isolation, Jetstream mapping, account and sync markers, rejected input.
+- `BigtableCurrentStateTest`: same-millisecond and concurrent writes, stale
+  create after delete, replay with empty Flink state, account purge, flush
+  failure.
+- `CurrentStateApiTest`: the HTTP contract and account visibility.
+- `TransactionalPublisherTest`: failed send, failed commit, quarantine, resume.
+- `SavepointRecoveryTest`: keyed state restored from a savepoint into a job with
+  another source suppresses an older revision.
+
+[`tools/discrimination-check.sh`](../tools/discrimination-check.sh) reintroduces
+each guarded defect and requires the named tests to report an assertion failure.

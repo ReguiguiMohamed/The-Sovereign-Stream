@@ -1,0 +1,11 @@
+# Upload allowlist for `gcloud builds submit`: build inputs only.
+/*
+!/streaming/
+!/infra/
+!/deploy/
+!/tools/
+/streaming/target/
+.terraform/
+*.tfstate*
+*.tfvars
+*tfplan*

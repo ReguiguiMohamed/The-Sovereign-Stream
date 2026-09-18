@@ -1,18 +1,31 @@
 package dev.eventproof.streaming;
 
 import static com.google.cloud.bigtable.admin.v2.models.GCRules.GCRULES;
+import static dev.eventproof.streaming.Records.DID;
+import static dev.eventproof.streaming.Records.NEWER;
+import static dev.eventproof.streaming.Records.OLDER;
+import static dev.eventproof.streaming.Records.POST;
+import static dev.eventproof.streaming.Records.SAME_MS_NEWER;
+import static dev.eventproof.streaming.Records.post;
+import static dev.eventproof.streaming.Records.record;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertThrows;
 
+import com.google.api.core.ApiFuture;
+import com.google.api.core.ApiFutures;
 import com.google.cloud.bigtable.admin.v2.BigtableTableAdminClient;
 import com.google.cloud.bigtable.admin.v2.BigtableTableAdminSettings;
 import com.google.cloud.bigtable.admin.v2.models.CreateTableRequest;
 import com.google.cloud.bigtable.data.v2.BigtableDataClient;
-import com.google.cloud.bigtable.data.v2.BigtableDataSettings;
-import com.google.cloud.bigtable.data.v2.models.Query;
-import com.google.cloud.bigtable.data.v2.models.Row;
 import com.google.cloud.bigtable.data.v2.models.TableId;
 import com.google.cloud.bigtable.emulator.v2.BigtableEmulatorRule;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Random;
 import org.apache.flink.runtime.testutils.MiniClusterResourceConfiguration;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.test.util.MiniClusterWithClientResource;
@@ -22,19 +35,11 @@ import org.junit.ClassRule;
 import org.junit.Rule;
 import org.junit.Test;
 
-/**
- * EP-014, against the official bundled Bigtable emulator on a dynamic port.
- *
- * <p>The emulator is in-memory, so these tests prove the row contract, the client
- * behaviour and late-write materialization semantics. They prove nothing about
- * durability across a restart.
- */
+/** Bigtable row contract tests against the official bundled emulator. */
 public class BigtableCurrentStateTest {
     private static final String PROJECT = "eventproof-local";
     private static final String INSTANCE = "eventproof-local";
     private static final String TABLE = "current-state";
-    private static final String ENTITY_TYPE = "resource";
-    private static final String ENTITY_ID = "resource-0000";
 
     @ClassRule
     public static final MiniClusterWithClientResource FLINK =
@@ -58,13 +63,9 @@ public class BigtableCurrentStateTest {
                         .setInstanceId(INSTANCE)
                         .build())) {
             admin.createTable(CreateTableRequest.of(TABLE)
-                    .addFamily(CurrentStateRow.COLUMN_FAMILY, GCRULES.maxVersions(1)));
+                    .addFamily(CurrentStateRow.FAMILY, GCRULES.maxVersions(1)));
         }
-        data = BigtableDataClient.create(
-                BigtableDataSettings.newBuilderForEmulator(emulator.getPort())
-                        .setProjectId(PROJECT)
-                        .setInstanceId(INSTANCE)
-                        .build());
+        data = BigtableDataClient.create(CurrentStateRow.settings(PROJECT, INSTANCE, host()));
     }
 
     @After
@@ -74,117 +75,124 @@ public class BigtableCurrentStateTest {
         }
     }
 
-    /**
-     * The storage rule alone, with no Flink filter in front of it: a mutation
-     * carrying an older event_time cannot become the visible current value even
-     * when it is written last.
-     */
     @Test
-    public void aLaterMutationWithAnOlderEventTimeDoesNotBecomeCurrent() throws Exception {
-        OperationalStateEvent newer =
-                event("a".repeat(64), 0, "2026-08-25T00:00:00Z", "completed");
-        OperationalStateEvent late =
-                event("b".repeat(64), 1, "2026-08-24T23:58:00Z", "processing");
+    public void sameMillisecondOlderRevisionWrittenLastIsIgnored() throws Exception {
+        write(post(SAME_MS_NEWER, "delete"));
+        write(post(OLDER, "create"));
 
-        data.mutateRow(CurrentStateRow.mutation(TABLE, newer));
-        data.mutateRow(CurrentStateRow.mutation(TABLE, late));
-
-        OperationalStateEvent current =
-                CurrentStateRow.read(data, TABLE, ENTITY_TYPE, ENTITY_ID);
-
-        assertNotNull(current);
-        assertEquals(newer.getEventId(), current.getEventId());
-        assertEquals("completed", current.getState());
-        assertEquals("2026-08-25T00:00:00Z", current.getEventTime());
+        assertEquals(SAME_MS_NEWER, current().revision);
     }
 
-    /** The whole path: MiniCluster job -> production sink -> emulator row. */
     @Test
-    public void flinkSinkMaterializesOneCurrentRowPerEntity() throws Exception {
-        OperationalStateEvent newer =
-                event("a".repeat(64), 0, "2026-08-25T00:00:00Z", "completed");
-        OperationalStateEvent late =
-                event("b".repeat(64), 1, "2026-08-24T23:58:00Z", "processing");
+    public void staleCreateAfterDeleteIsIgnored() throws Exception {
+        write(post(NEWER, "delete"));
+        write(post(OLDER, "create"));
+        write(post(NEWER, "delete"));
 
+        assertEquals("deleted", current().state);
+    }
+
+    /** Concurrent, shuffled and repeated writes still leave the newest revision. */
+    @Test
+    public void concurrentAndRetriedWritesKeepTheNewest() throws Exception {
+        List<String> revisions = new ArrayList<>();
+        for (String revision : List.of(OLDER, SAME_MS_NEWER, NEWER)) {
+            for (int copy = 0; copy < 20; copy++) {
+                revisions.add(revision);
+            }
+        }
+        Collections.shuffle(revisions, new Random(20260917));
+        List<ApiFuture<Boolean>> writes = new ArrayList<>();
+        for (String revision : revisions) {
+            writes.add(data.checkAndMutateRowAsync(
+                    CurrentStateRow.write(TABLE, post(revision, "create"))));
+        }
+        ApiFutures.allAsList(writes).get();
+
+        assertEquals(NEWER, current().revision);
+    }
+
+    /** A second job with empty Flink state replays an older revision; storage keeps the newer. */
+    @Test
+    public void replayWithEmptyFlinkStateKeepsTheNewest() throws Exception {
+        runJob(post(NEWER, "delete"));
+        runJob(post(OLDER, "create"));
+
+        assertEquals("deleted", current().state);
+    }
+
+    @Test
+    public void accountDeletionPurgesEarlierRecordsAndHidesTheRest() throws Exception {
+        RecordStateEvent before = record(POST, DID + "/before", OLDER, "create", 10);
+        RecordStateEvent after = record(POST, DID + "/after", OLDER, "create", 30);
+        try (BigtableCurrentStateSink.Writer writer = writer()) {
+            writer.write(before, null);
+            writer.write(after, null);
+            writer.write(Records.account(DID, 20, "deleted"), null);
+            writer.flush(false);
+        }
+
+        assertEquals(null, data.readRow(TableId.of(TABLE), CurrentStateRow.rowKey(before)));
+        assertNotNull(data.readRow(TableId.of(TABLE), CurrentStateRow.rowKey(after)));
+        assertNull(CurrentStateRow.read(data, TABLE, POST, after.entityId));
+    }
+
+    @Test
+    public void syncPurgesEarlierRecordsOnlyAndAnOlderPurgeCannotLowerIt() throws Exception {
+        RecordStateEvent before = record(POST, DID + "/before", OLDER, "create", 10);
+        RecordStateEvent after = record(POST, DID + "/after", OLDER, "create", 30);
+        try (BigtableCurrentStateSink.Writer writer = writer()) {
+            writer.write(before, null);
+            writer.write(after, null);
+            writer.write(Records.sync(DID, 20), null);
+            writer.write(Records.sync(DID, 5), null);
+            writer.flush(false);
+        }
+        write(before);
+
+        assertNull(CurrentStateRow.read(data, TABLE, POST, before.entityId));
+        RecordStateEvent visible = CurrentStateRow.read(data, TABLE, POST, after.entityId);
+        assertNotNull(visible);
+        assertEquals(after.eventId, visible.eventId);
+    }
+
+    /** A rejected mutation fails the flush, so the checkpoint that needs it fails. */
+    @Test
+    public void aRejectedMutationFailsTheFlush() throws Exception {
+        try (BigtableCurrentStateSink.Writer writer = new BigtableCurrentStateSink.Writer(
+                BigtableDataClient.create(CurrentStateRow.settings(PROJECT, INSTANCE, host())),
+                "missing-table")) {
+            writer.write(post(OLDER, "create"), null);
+
+            assertThrows(IOException.class, () -> writer.flush(false));
+        }
+    }
+
+    private String host() {
+        return "localhost:" + emulator.getPort();
+    }
+
+    private BigtableCurrentStateSink.Writer writer() throws IOException {
+        return new BigtableCurrentStateSink.Writer(
+                BigtableDataClient.create(CurrentStateRow.settings(PROJECT, INSTANCE, host())),
+                TABLE);
+    }
+
+    private void write(RecordStateEvent event) throws Exception {
+        data.checkAndMutateRow(CurrentStateRow.write(TABLE, event));
+    }
+
+    private RecordStateEvent current() throws Exception {
+        return CurrentStateRow.read(data, TABLE, POST, Records.POST_ID);
+    }
+
+    private void runJob(RecordStateEvent... events) throws Exception {
         StreamExecutionEnvironment environment =
                 StreamExecutionEnvironment.getExecutionEnvironment();
         environment.setParallelism(1);
         CurrentStateJob
-                .currentStateUpdates(environment.fromData(newer, newer, late))
-                .sinkTo(BigtableCurrentStateSink
-                        .forEmulator(PROJECT, INSTANCE, TABLE, emulator.getPort()));
-        // Bounded source: execute() returns when the job is finished, so the row is
-        // readable without polling or sleeping.
+                .currentStateUpdates(environment.fromData(events))
+                .sinkTo(new BigtableCurrentStateSink(PROJECT, INSTANCE, TABLE, host()));
         environment.execute("bigtable-current-state-test");
-
-        OperationalStateEvent current =
-                CurrentStateRow.read(data, TABLE, ENTITY_TYPE, ENTITY_ID);
-
-        assertNotNull(current);
-        assertEquals(newer.getEventId(), current.getEventId());
-        assertEquals("completed", current.getState());
-        assertEquals(1, rowCount());
-    }
-
-    /**
-     * Bigtable creates tables with MILLIS granularity and rejects a cell timestamp
-     * that is not a whole millisecond, so the cell version resolves to exactly one
-     * millisecond. This locks both halves of that: sub-millisecond detail is lost,
-     * and one millisecond of difference still orders two events.
-     */
-    @Test
-    public void cellVersionIsAWholeMillisecondAndOrdersAtThatResolution() throws Exception {
-        OperationalStateEvent newer =
-                event("a".repeat(64), 0, "2026-08-25T00:00:00.002000Z", "completed");
-        OperationalStateEvent sameMillisecond =
-                event("b".repeat(64), 1, "2026-08-25T00:00:00.002999Z", "processing");
-        OperationalStateEvent olderMillisecond =
-                event("c".repeat(64), 2, "2026-08-25T00:00:00.001000Z", "processing");
-
-        // The known limit: 999 microseconds of difference collapse onto one cell.
-        assertEquals(
-                CurrentStateRow.cellTimestampMicros(newer),
-                CurrentStateRow.cellTimestampMicros(sameMillisecond));
-        // One millisecond of difference survives, and the value stays millisecond
-        // aligned so Bigtable accepts it.
-        assertEquals(
-                1_000L,
-                CurrentStateRow.cellTimestampMicros(newer)
-                        - CurrentStateRow.cellTimestampMicros(olderMillisecond));
-        assertEquals(0L, CurrentStateRow.cellTimestampMicros(newer) % 1_000L);
-
-        data.mutateRow(CurrentStateRow.mutation(TABLE, newer));
-        data.mutateRow(CurrentStateRow.mutation(TABLE, olderMillisecond));
-
-        OperationalStateEvent current =
-                CurrentStateRow.read(data, TABLE, ENTITY_TYPE, ENTITY_ID);
-
-        assertNotNull(current);
-        assertEquals(newer.getEventId(), current.getEventId());
-        assertEquals("completed", current.getState());
-    }
-
-    private int rowCount() {
-        int rows = 0;
-        for (Row ignored : data.readRows(Query.create(TableId.of(TABLE)))) {
-            rows++;
-        }
-        return rows;
-    }
-
-    private static OperationalStateEvent event(
-            String eventId, int sequence, String eventTime, String state) {
-        return new OperationalStateEvent(
-                "operational-state.v1",
-                eventId,
-                "bigtable-test",
-                sequence,
-                "synthetic",
-                ENTITY_TYPE,
-                ENTITY_ID,
-                "state.updated",
-                eventTime,
-                "2026-08-25T00:00:01Z",
-                state);
     }
 }

@@ -4,80 +4,174 @@ import static com.google.cloud.bigtable.data.v2.models.Filters.FILTERS;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.google.cloud.bigtable.data.v2.BigtableDataClient;
+import com.google.cloud.bigtable.data.v2.BigtableDataSettings;
+import com.google.cloud.bigtable.data.v2.models.ConditionalRowMutation;
 import com.google.cloud.bigtable.data.v2.models.Filters.Filter;
+import com.google.cloud.bigtable.data.v2.models.Mutation;
+import com.google.cloud.bigtable.data.v2.models.Query;
 import com.google.cloud.bigtable.data.v2.models.Row;
-import com.google.cloud.bigtable.data.v2.models.RowMutation;
+import com.google.cloud.bigtable.data.v2.models.RowCell;
 import com.google.cloud.bigtable.data.v2.models.TableId;
-import java.time.Instant;
+import com.google.protobuf.ByteString;
+import java.io.IOException;
+import java.util.HashMap;
+import java.util.Map;
 
 /**
  * The Bigtable current-state row contract, described in
  * docs/adr/0002-bigtable-current-state.md.
  *
- * <p>Writing and reading live together because they are one contract: the cell
- * the writer produces is the cell the reader must select.
+ * <p>Every write is a check-and-mutate: the server compares the stored order key
+ * with the new one and applies the mutation atomically only when the new one is
+ * greater, so order holds under batching, retries, replay and expired Flink state.
  */
 final class CurrentStateRow {
-    static final String COLUMN_FAMILY = "cs";
-    static final String EVENT_QUALIFIER = "event";
-
-    /** Narrows the point read to the newest version of the one cell we store. */
-    private static final Filter NEWEST_EVENT_CELL = FILTERS.chain()
-            .filter(FILTERS.family().exactMatch(COLUMN_FAMILY))
-            .filter(FILTERS.qualifier().exactMatch(EVENT_QUALIFIER))
-            .filter(FILTERS.limit().cellsPerColumn(1));
+    static final String FAMILY = "cs";
+    static final String EVENT = "event";
+    static final String REVISION = "revision";
+    static final String SEQ = "seq";
+    static final String PURGE = "purge";
+    // One version per cell: a later successful write replaces it.
+    private static final long VERSION = 0;
 
     private CurrentStateRow() {}
 
-    /**
-     * {@code entity_type} and {@code entity_id} are free-form, so a plain
-     * delimiter join is not injective: ("a#b", "c") and ("a", "b#c") would share a
-     * key. Escaping first leaves exactly one raw '#', which is the separator.
-     */
+    /** Escaping leaves exactly one raw '#'; Flink state uses the same key. */
     static String rowKey(String entityType, String entityId) {
         return escape(entityType) + "#" + escape(entityId);
+    }
+
+    static String rowKey(RecordStateEvent event) {
+        return rowKey(event.entityType, event.entityId);
+    }
+
+    static String accountKey(String did) {
+        return rowKey(JetstreamMapping.ACCOUNT, did);
     }
 
     private static String escape(String component) {
         return component.replace("%", "%25").replace("#", "%23");
     }
 
-    static RowMutation mutation(String tableId, OperationalStateEvent event)
+    /** Fixed width, so byte order is numeric order. */
+    static String padded(long seq) {
+        return String.format("%020d", seq);
+    }
+
+    static boolean purges(RecordStateEvent event) {
+        return JetstreamMapping.SYNC.equals(event.eventType)
+                || (JetstreamMapping.ACCOUNT.equals(event.eventType)
+                        && "deleted".equals(event.state));
+    }
+
+    static BigtableDataSettings settings(
+            String projectId, String instanceId, String emulatorHost) {
+        BigtableDataSettings.Builder builder;
+        if (emulatorHost == null) {
+            builder = BigtableDataSettings.newBuilder();
+        } else {
+            int colon = emulatorHost.lastIndexOf(':');
+            builder = BigtableDataSettings.newBuilderForEmulator(
+                    emulatorHost.substring(0, colon),
+                    Integer.parseInt(emulatorHost.substring(colon + 1)));
+        }
+        return builder.setProjectId(projectId).setInstanceId(instanceId).build();
+    }
+
+    /** Stores the event unless the row already holds this or a later revision. */
+    static ConditionalRowMutation write(String tableId, RecordStateEvent event)
             throws JsonProcessingException {
-        return RowMutation.create(TableId.of(tableId), rowKey(event.entityType, event.entityId))
-                .setCell(
-                        COLUMN_FAMILY,
-                        EVENT_QUALIFIER,
-                        cellTimestampMicros(event),
-                        EventJson.write(event));
+        return ConditionalRowMutation.create(TableId.of(tableId), rowKey(event))
+                .condition(atLeast(REVISION, event.revision))
+                .otherwise(Mutation.create()
+                        .setCell(FAMILY, EVENT, VERSION, EventJson.write(event))
+                        .setCell(FAMILY, REVISION, VERSION, event.revision)
+                        .setCell(FAMILY, SEQ, VERSION, padded(event.sourceSeq)));
+    }
+
+    /** Raises the account's purge boundary to this event's sequence. */
+    static ConditionalRowMutation purgeMarker(String tableId, RecordStateEvent event) {
+        String seq = padded(event.sourceSeq);
+        return ConditionalRowMutation.create(TableId.of(tableId), accountKey(event.entityId))
+                .condition(atLeast(PURGE, seq))
+                .otherwise(Mutation.create().setCell(FAMILY, PURGE, VERSION, seq));
     }
 
     /**
-     * The cell version is the event's own time, never arrival time: arrival time
-     * would let a late delivery become the newest cell.
-     *
-     * <p>Bigtable expresses timestamps in microseconds but creates tables with
-     * MILLIS granularity and rejects any value that is not a whole millisecond, so
-     * the sub-millisecond part is dropped here rather than at write time. Two
-     * events inside one millisecond therefore share a cell and cannot be ordered
-     * by storage.
+     * Deletes the account's records whose sequence is at or below the purge
+     * event's. Later records, written after the marker, stay.
      */
-    static long cellTimestampMicros(OperationalStateEvent event) {
-        Instant eventTime = Instant.parse(event.getEventTime());
-        return Math.addExact(
-                Math.multiplyExact(eventTime.getEpochSecond(), 1_000_000L),
-                (eventTime.getNano() / 1_000_000) * 1_000L);
+    static void purgeRecords(BigtableDataClient client, String tableId, RecordStateEvent event) {
+        String seq = padded(event.sourceSeq);
+        for (String collection : JetstreamMapping.COLLECTIONS) {
+            Query rows = Query.create(TableId.of(tableId))
+                    .prefix(rowKey(collection, event.entityId + "/"))
+                    .filter(FILTERS.chain()
+                            .filter(column(SEQ))
+                            .filter(FILTERS.value().strip()));
+            for (Row row : client.readRows(rows)) {
+                client.checkAndMutateRow(
+                        ConditionalRowMutation.create(TableId.of(tableId), row.getKey())
+                                .condition(FILTERS.chain()
+                                        .filter(column(SEQ))
+                                        .filter(FILTERS.value().range().endClosed(seq)))
+                                .then(Mutation.create().deleteRow()));
+            }
+        }
     }
 
-    /** Returns the current event for one entity, or null when the row is absent. */
-    static OperationalStateEvent read(
+    /**
+     * Returns the stored event for one entity, or null when it is absent or its
+     * account hides it: an inactive account, or a purge at or after the record.
+     * At most two rows are read.
+     */
+    static RecordStateEvent read(
             BigtableDataClient client, String tableId, String entityType, String entityId)
-            throws JsonProcessingException {
-        Row row = client.readRow(
-                TableId.of(tableId), rowKey(entityType, entityId), NEWEST_EVENT_CELL);
-        if (row == null || row.getCells().isEmpty()) {
+            throws IOException {
+        String key = rowKey(entityType, entityId);
+        Query query = Query.create(TableId.of(tableId))
+                .rowKey(key)
+                .filter(FILTERS.chain()
+                        .filter(FILTERS.family().exactMatch(FAMILY))
+                        .filter(FILTERS.limit().cellsPerColumn(1)));
+        String accountKey = null;
+        if (JetstreamMapping.COLLECTIONS.contains(entityType)) {
+            accountKey = accountKey(entityId.substring(0, Math.max(0, entityId.indexOf('/'))));
+            query.rowKey(accountKey);
+        }
+        Map<ByteString, Map<String, String>> rows = new HashMap<>();
+        for (Row row : client.readRows(query)) {
+            Map<String, String> cells = new HashMap<>();
+            for (RowCell cell : row.getCells()) {
+                cells.put(cell.getQualifier().toStringUtf8(), cell.getValue().toStringUtf8());
+            }
+            rows.put(row.getKey(), cells);
+        }
+        Map<String, String> record = rows.get(ByteString.copyFromUtf8(key));
+        if (record == null || !record.containsKey(EVENT)) {
             return null;
         }
-        return EventJson.read(row.getCells().get(0).getValue().toStringUtf8());
+        Map<String, String> account = accountKey == null
+                ? Map.of() : rows.getOrDefault(ByteString.copyFromUtf8(accountKey), Map.of());
+        if (account.containsKey(EVENT)
+                && !"active".equals(EventJson.read(account.get(EVENT)).state)) {
+            return null;
+        }
+        if (account.containsKey(PURGE) && record.get(SEQ).compareTo(account.get(PURGE)) <= 0) {
+            return null;
+        }
+        return EventJson.read(record.get(EVENT));
+    }
+
+    private static Filter column(String qualifier) {
+        return FILTERS.chain()
+                .filter(FILTERS.family().exactMatch(FAMILY))
+                .filter(FILTERS.qualifier().exactMatch(qualifier));
+    }
+
+    private static Filter atLeast(String qualifier, String value) {
+        return FILTERS.chain()
+                .filter(column(qualifier))
+                .filter(FILTERS.value().range().startClosed(value));
     }
 }

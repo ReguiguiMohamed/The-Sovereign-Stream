@@ -1,145 +1,78 @@
 # The Sovereign Stream
 
-EventProof is a production-shaped proof of concept for a replayable GCP event
-architecture. It incrementally proves state correctness, materialization,
-recovery, observability, bounded querying, infrastructure reproducibility and
-cost-controlled operation.
-
-Code namespace: `eventproof`.
-
-## The problem
-
-Operational event streams redeliver and reorder. Any at-least-once pipeline
-eventually delivers the same event twice, and any distributed producer eventually
-delivers an older event after a newer one. Most streaming demonstrations measure
-throughput on clean, ordered input. State correctness under redelivery and
-reordering is the first thing this project proves, and the foundation the later
-layers build on.
-
-## The two invariants
-
-1. **An exact redelivery is acknowledged but never applied twice.** A duplicate
-   event produces no second current-state update.
-2. **A late event never overwrites newer state.** An event whose `event_time` is
-   120 seconds older than the entity's current state is accepted as delivered,
-   and the newer state stands.
-
-Both are evaluated per entity, from deterministic input, with the expected result
-recorded in a manifest before the stream processor runs.
-
-## Approach
-
-Correctness first, infrastructure second. State transitions are proved in a local
-Flink MiniCluster against deterministic input before a broker, container or cloud
-resource enters the picture: a wrong transition is easiest to catch when nothing
-else can hide it.
-
-Each layer proves one thing and is not evidence for the layers above it. The full
-ladder, from deterministic contract tests to cloud cost and teardown evidence, is
-in [`docs/end-to-end-plan.md`](docs/end-to-end-plan.md).
-
-## Architecture
-
-Target path:
+A public social-activity observatory on GCP. Live Bluesky activity flows through
+Kafka and Flink into Bigtable and is served by a Cloud Run API. Code namespace:
+`eventproof`. Current brief: [cloud initiation](docs/cloud-initiation.md).
 
 ```text
-event source
+Bluesky Jetstream v2
+  -> JetstreamProducer (GKE)
   -> Managed Service for Apache Kafka
-  -> Apache Flink 2.2.1 on GKE
+  -> CurrentStateJob (Flink 2.2.1 on GKE, checkpoints in GCS)
   -> Bigtable current state
-  -> bounded Cloud Run query API
+  -> CurrentStateApi (Cloud Run)
 ```
 
-GCS holds checkpoints and savepoints, Managed Prometheus holds runtime metrics,
-and Terraform defines every resource. Kafka ingestion is exercised against
-Managed Service for Apache Kafka inside a time-capped evidence window.
+## Guarantees
 
-Local path, which gates every cloud step:
+1. A redelivered revision is never applied twice.
+2. An older revision never replaces a newer one: Bigtable compares revisions on
+   the server, so concurrency, retries, replay and expired Flink state converge
+   on the newest.
+3. A deleted record converges to `deleted`.
+4. Records with the same id but different types stay separate.
+5. A deleted account's earlier records are purged, and its records stay hidden
+   while it is inactive.
+6. The producer's resume cursor never passes an unpublished message: each batch
+   is one Kafka transaction, and malformed messages are quarantined in it.
+7. Keyed state restores from a savepoint.
 
-```text
-deterministic generator (NDJSON)
-  -> Apache Flink 2.2.1 MiniCluster
-  -> Bigtable emulator current state
-  -> bounded local query API
-```
+Each guarantee has a test, and the
+[discrimination check](tools/discrimination-check.sh) requires the named test to
+report an assertion failure when the defect is put back.
 
 ## Done
 
-- `operational-state.v1` contract with canonical JSON encoding and SHA-256 event
-  identity.
-- Deterministic generator producing baseline, exact-duplicate and 120-second-late
-  scenarios, plus a verification manifest recording expected current state per
-  entity.
-- Apache Flink 2.2.1 job on JDK 17: NDJSON parsing, keyed per-entity state and
-  newest-wins current-state emission.
-- MiniCluster tests proving both invariants, and a generator-to-Flink run whose
-  output matches the manifest.
-- Bigtable current-state materialization against the official emulator: one row
-  per entity, the whole event stored as a JSON cell timestamped with its
-  `event_time` under `maxVersions(1)`, so a mutation carrying an older
-  `event_time` cannot become the visible current value even when it is written
-  last. Proved twice — through the Bigtable client alone, and end to end through
-  the Flink sink. The emulator is in-memory, so this proves the data contract and
-  materialization semantics, not durability across a restart.
-- A bounded local query API: `GET /v1/current-state?entity_type=&entity_id=`
-  answers from exactly one Bigtable point read on the JDK HTTP server, with no
-  scan, listing or pagination. Loopback-only and unauthenticated, so it is a proof
-  of the query path rather than a deployable service.
-- CI reproducing the Python, Flink, Bigtable emulator and query API gates on
-  every push.
+- GCP project `eventproof-stream-2609` with Cloud Build bootstrap and an
+  owner-run IAM script ([infra](infra/README.md)).
+- `record-state.v1` contract for Bluesky record revisions and account markers
+  ([streaming](streaming/README.md)).
+- Transactional Jetstream producer that resumes from the last committed record.
+- Flink job reading Kafka and writing Bigtable through conditional writes.
+- Query API ready for Cloud Run, hiding purged and inactive-account records.
+- [Cloud Build pipeline](cloudbuild.yaml): tests, shaded jar, both images, and a
+  smoke test of the packaged images against live Jetstream.
+- Terraform evidence root and the scheduled, verified teardown it is pinned to.
+- Operator install and workload manifests for GKE ([deploy](deploy/)).
+- [Jetstream sample](tools/jetstream-sample.yaml) and
+  [cost estimate](docs/cost-estimate.md) from measured traffic.
 
-## Next
-
-- Checkpointing with restart and recovery tests, plus accepted, suppressed and
-  late counters.
-- Container images for the streaming job and the query API.
-- Terraform covering the three resource classes: bootstrap control plane,
-  evidence-window data plane and an explicitly approved retained set that is empty
-  by default. Bigtable, Kafka and GCS belong to the evidence window and are
-  destroyed with it.
-- Managed Kafka ingestion and replay, exercised in a GCP evidence window.
-
-Sequencing and cost gates are in [`docs/end-to-end-plan.md`](docs/end-to-end-plan.md);
-the item-level breakdown is in [`docs/backlog.md`](docs/backlog.md).
-
-## Quick start
-
-Requires Python 3.12+, JDK 17 and Maven 3.8.6+.
+## Build
 
 ```bash
-python -m pip install ".[test]"
-python -m unittest discover -s tests
-mvn --batch-mode --file streaming/pom.xml verify
+gcloud builds submit --config=cloudbuild.yaml --region=europe-west1 \
+  --project=eventproof-stream-2609 \
+  --gcs-source-staging-dir=gs://eventproof-stream-2609-build-source/source \
+  --service-account=projects/eventproof-stream-2609/serviceAccounts/cloud-build@eventproof-stream-2609.iam.gserviceaccount.com
 ```
-
-Run a late delivery end to end:
-
-```bash
-python -m eventproof.simulator \
-  --run-id demo --seed 20260826 --count 3 --scenario late-120s \
-  --output benchmarks/evidence/demo.events.ndjson \
-  --manifest benchmarks/evidence/demo.manifest.ndjson
-
-mvn --file streaming/pom.xml \
-  -Devents.file=../benchmarks/evidence/demo.events.ndjson \
-  compile exec:exec
-```
-
-The job prints current-state updates only. The event delivered 120 seconds late
-produces none, and the printed result matches `expected_current_state` in the
-generated manifest.
 
 ## Repository map
 
 | Path | Contents |
 | --- | --- |
-| [`contracts/`](contracts/) | Versioned event schemas |
-| [`eventproof/`](eventproof/README.md) | Event model and deterministic scenario generator |
-| [`streaming/`](streaming/README.md) | Flink current-state job, Bigtable materialization and the query API |
-| [`apps/`](apps/README.md) | Future external-event adapter |
-| [`infra/`](infra/README.md) | Terraform roots |
-| [`docs/`](docs/) | Architecture decision, delivery plan and backlog |
+| [`contracts/`](contracts/) | Event schema |
+| [`streaming/`](streaming/README.md) | Producer, Flink job, Bigtable contract, query API, Dockerfile |
+| [`tools/`](tools/) | Cloud Build sample and discrimination check |
+| [`infra/`](infra/README.md) | Bootstrap record and Terraform roots |
+| [`deploy/`](deploy/) | Flink operator install and Kubernetes workloads |
+| [`docs/`](docs/) | Briefs, decisions and checkpoints |
+
+## Data
+
+Bluesky public data through the free live Jetstream endpoint. Record bodies,
+text and media are not stored. See Bluesky's
+[developer guidelines](https://bsky.network/docs/developer-guidelines/).
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT for the code. See [LICENSE](LICENSE).

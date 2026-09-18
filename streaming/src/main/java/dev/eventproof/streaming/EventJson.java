@@ -7,7 +7,7 @@ import com.fasterxml.jackson.databind.PropertyNamingStrategies;
 import com.fasterxml.jackson.databind.json.JsonMapper;
 
 /**
- * The single JSON mapping for operational-state.v1.
+ * The single JSON mapping for record-state.v1.
  *
  * <p>Parsing and Bigtable storage share it so a stored event reads back with the
  * same contract field names it arrived with. Two mappers would let the wire form
@@ -26,11 +26,11 @@ final class EventJson {
 
     private EventJson() {}
 
-    static OperationalStateEvent read(String json) throws JsonProcessingException {
-        return MAPPER.readValue(json, OperationalStateEvent.class);
+    static RecordStateEvent read(String json) throws JsonProcessingException {
+        return MAPPER.readValue(json, RecordStateEvent.class);
     }
 
-    static String write(OperationalStateEvent event) throws JsonProcessingException {
+    static String write(RecordStateEvent event) throws JsonProcessingException {
         return MAPPER.writeValueAsString(event);
     }
 }

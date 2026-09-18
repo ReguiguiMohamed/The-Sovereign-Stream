@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "EventProof record state v1",
+  "description": "One revision of one Bluesky record, or one account-level marker.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "event_id",
+    "source",
+    "source_seq",
+    "entity_type",
+    "entity_id",
+    "event_type",
+    "revision",
+    "event_time",
+    "received_at",
+    "state",
+    "subject"
+  ],
+  "properties": {
+    "schema_version": { "const": "record-state.v1" },
+    "event_id": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "source": { "type": "string", "minLength": 1 },
+    "source_seq": { "type": "integer", "minimum": 0 },
+    "entity_type": { "type": "string" },
+    "entity_id": { "type": "string" },
+    "event_type": { "type": "string" },
+    "revision": { "type": "string" },
+    "event_time": { "type": "string", "format": "date-time" },
+    "received_at": { "type": "string", "format": "date-time" },
+    "state": { "type": "string", "minLength": 1 },
+    "subject": { "type": ["string", "null"] }
+  },
+  "oneOf": [
+    {
+      "description": "Record revision; revision is the repository commit TID.",
+      "properties": {
+        "entity_type": { "enum": ["app.bsky.feed.post", "app.bsky.feed.like", "app.bsky.feed.repost"] },
+        "entity_id": { "pattern": "^did:[a-z]+:[a-zA-Z0-9._:%-]+/[a-zA-Z0-9._:~-]{1,512}$" },
+        "event_type": { "enum": ["create", "update", "delete"] },
+        "revision": { "pattern": "^[2-7a-j][2-7a-z]{12}$" },
+        "state": { "enum": ["active", "deleted"] }
+      }
+    },
+    {
+      "description": "Account status; state is active or the source status. Deleted purges the account's earlier records.",
+      "properties": {
+        "entity_type": { "const": "account" },
+        "event_type": { "const": "account" },
+        "entity_id": { "pattern": "^did:[a-z]+:[a-zA-Z0-9._:%-]+$" },
+        "revision": { "pattern": "^[0-9]{20}$" },
+        "subject": { "const": null }
+      }
+    },
+    {
+      "description": "Sync divergence; purges the account's earlier records.",
+      "properties": {
+        "entity_type": { "const": "sync" },
+        "event_type": { "const": "sync" },
+        "entity_id": { "pattern": "^did:[a-z]+:[a-zA-Z0-9._:%-]+$" },
+        "revision": { "pattern": "^[0-9]{20}$" },
+        "state": { "const": "resynced" },
+        "subject": { "const": null }
+      }
+    }
+  ]
+}

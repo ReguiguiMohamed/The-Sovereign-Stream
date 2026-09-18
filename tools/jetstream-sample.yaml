@@ -1,0 +1,112 @@
+# Measures the live Jetstream feed from GCP for 15 minutes, with one forced
+# reconnect, and stores a record-body-free capture plus a summary in GCS:
+#   gcloud builds submit --no-source --config=tools/jetstream-sample.yaml \
+#     --region=europe-west1 --project=eventproof-stream-2609 \
+#     --service-account=projects/eventproof-stream-2609/serviceAccounts/cloud-build@eventproof-stream-2609.iam.gserviceaccount.com
+steps:
+  - id: sample
+    name: python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        pip install --quiet --no-cache-dir websockets==15.0.1 && python - <<'EOF'
+        import asyncio, collections, gzip, json, statistics, time
+        from datetime import datetime
+        import websockets
+
+        URL = ("wss://jetstream.us-east.bsky.network/xrpc/network.bsky.jetstream.subscribeEvents"
+               "?collections=app.bsky.feed.post&collections=app.bsky.feed.like"
+               "&collections=app.bsky.feed.repost")
+        AGENT = "eventproof-sample (+https://github.com/ReguiguiMohamed/The-Sovereign-Stream)"
+        HALF = 450
+
+        minutes = collections.defaultdict(lambda: [0, 0])
+        mix, kinds, lag = collections.Counter(), collections.Counter(), []
+        seen, revisions = set(), {}
+        state = {"parse_failures": 0, "redelivered": 0, "rev_regressions": 0,
+                 "created_then_deleted": 0, "records_with_several_ops": 0}
+        ops = collections.defaultdict(list)
+        resume = {}
+
+        async def read(capture, cursor, seconds):
+            url = URL + (f"&cursor={cursor}" if cursor else "")
+            last, first = cursor, None
+            async with websockets.connect(url, user_agent_header=AGENT, max_size=2**22) as ws:
+                end = time.monotonic() + seconds
+                while time.monotonic() < end:
+                    raw = await asyncio.wait_for(ws.recv(), 30)
+                    now = time.time()
+                    minutes[int(now // 60)][0] += 1
+                    minutes[int(now // 60)][1] += len(raw.encode() if isinstance(raw, str) else raw)
+                    try:
+                        m = json.loads(raw)
+                        p = m["payload"]
+                        kinds[p["$$type"].split("#")[-1]] += 1
+                        if not p["$$type"].endswith("#commit"):
+                            continue
+                        seq = p["seq"]
+                        first = seq if first is None else first
+                        key = (p["did"], p["collection"], p["rkey"])
+                        ident = key + (p["rev"], p["operation"])
+                        if ident in seen:
+                            state["redelivered"] += 1
+                            continue
+                        seen.add(ident)
+                        if key in revisions and p["rev"] <= revisions[key]:
+                            state["rev_regressions"] += 1
+                        revisions[key] = max(p["rev"], revisions.get(key, ""))
+                        ops[key].append(p["operation"])
+                        mix[(p["collection"], p["operation"])] += 1
+                        lag.append(now - datetime.fromisoformat(p["time"]).timestamp())
+                        capture.write(json.dumps({"seq": seq, "time": p["time"], "did": p["did"],
+                            "collection": p["collection"], "rkey": p["rkey"], "rev": p["rev"],
+                            "operation": p["operation"]}) + "\n")
+                        last = seq
+                    except (KeyError, TypeError, ValueError):
+                        state["parse_failures"] += 1
+            return last, first
+
+        async def main():
+            with gzip.open("/workspace/capture.ndjson.gz", "wt") as capture:
+                last, _ = await read(capture, None, HALF)
+                resume["cursor"] = last
+                _, first = await read(capture, last, HALF)
+                resume["first_seq_after_resume"] = first
+                resume["cursor_is_inclusive"] = first == last
+
+        asyncio.run(main())
+        for key, sequence in ops.items():
+            if len(sequence) > 1:
+                state["records_with_several_ops"] += 1
+            if "create" in sequence and sequence[-1] == "delete":
+                state["created_then_deleted"] += 1
+        full = sorted(minutes)[1:-1]
+        rates = [minutes[m][0] / 60 for m in full]
+        byte_rates = [minutes[m][1] / 60 for m in full]
+        total_msgs = sum(v[0] for v in minutes.values())
+        total_bytes = sum(v[1] for v in minutes.values())
+        pct = lambda xs, q: sorted(xs)[min(len(xs) - 1, int(q * len(xs)))]
+        summary = {
+            "endpoint": URL, "window_seconds": 2 * HALF, "full_minutes": len(full),
+            "messages_per_second": {"min": min(rates), "median": statistics.median(rates), "p95": pct(rates, 0.95)},
+            "bytes_per_second": {"min": min(byte_rates), "median": statistics.median(byte_rates), "p95": pct(byte_rates, 0.95)},
+            "bytes_per_message": total_msgs and total_bytes / total_msgs,
+            "unique_commits": len(seen), "message_kinds": dict(kinds),
+            "operation_mix": {f"{c} {o}": n for (c, o), n in sorted(mix.items())},
+            "source_lag_seconds": {"median": statistics.median(lag), "p95": pct(lag, 0.95), "max": max(lag)},
+            "resume": resume, **state,
+        }
+        json.dump(summary, open("/workspace/summary.json", "w"), indent=2)
+        print(json.dumps(summary, indent=2))
+        EOF
+
+  - id: store
+    name: gcr.io/cloud-builders/gcloud
+    args: [storage, cp, /workspace/capture.ndjson.gz, /workspace/summary.json,
+           "gs://${PROJECT_ID}-capture/jetstream-sample/${BUILD_ID}/"]
+
+logsBucket: gs://${PROJECT_ID}-build-source/logs
+timeout: 1500s
+options:
+  logging: GCS_ONLY

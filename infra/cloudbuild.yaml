@@ -1,0 +1,89 @@
+# Terraform for one root. _ACTION is bundle, plan, apply or destroy.
+#   bundle   evidence only: upload the teardown bundle (config, lock, variables,
+#            teardown script) to the versioned state bucket and print its generation
+#   plan     fmt, validate and a saved plan
+#   apply    plan, then apply; an evidence apply first proves the pinned teardown
+#            bundle matches this configuration and the window is still open
+#   destroy  plan -destroy, then apply
+# Run from the repository root, for example:
+#   gcloud builds submit --config=infra/cloudbuild.yaml --region=europe-west1 \
+#     --project=eventproof-stream-2609 \
+#     --gcs-source-staging-dir=gs://eventproof-stream-2609-build-source/source \
+#     --service-account=projects/eventproof-stream-2609/serviceAccounts/cloud-build@eventproof-stream-2609.iam.gserviceaccount.com \
+#     --substitutions=_ROOT=evidence,_ACTION=plan,_TFVARS=<base64 tfvars>
+steps:
+  - id: guard
+    name: gcr.io/cloud-builders/gcloud
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        echo "${_TFVARS}" | base64 -d > infra/${_ROOT}/terraform.tfvars
+        [ "${_ROOT}" = evidence ] || exit 0
+        bundle=gs://${PROJECT_ID}-tfstate/teardown/evidence.tgz
+        if [ "${_ACTION}" = bundle ]; then
+          tar czf /workspace/evidence.tgz --exclude=.terraform infra/evidence infra/teardown.sh
+          gcloud storage cp /workspace/evidence.tgz "$$bundle"
+          gcloud storage objects describe "$$bundle" --format="value(generation)" \
+            | tee /workspace/generation.txt
+          exit 0
+        fi
+        [ "${_ACTION}" = apply ] || exit 0
+        gcloud storage cat gs://${PROJECT_ID}-tfstate/control/default.tfstate > /tmp/control.json
+        read -r window_end generation < <(python3 -c "import json; o=json.load(open('/tmp/control.json'))['outputs']; print(o['window_end']['value'], o['bundle_generation']['value'])")
+        # Apply only with at least 30 minutes left before the scheduled teardown.
+        if [ "$$(date -u +%s)" -gt "$$(( $$(date -u -d "$$window_end" +%s) - 1800 ))" ]; then
+          echo "window ends $$window_end: refusing to apply"; exit 1
+        fi
+        gcloud storage cp "$$bundle#$$generation" /tmp/pinned.tgz
+        mkdir /tmp/pinned && tar xzf /tmp/pinned.tgz -C /tmp/pinned
+        diff -r --exclude=.terraform /tmp/pinned/infra/evidence infra/evidence
+        diff /tmp/pinned/infra/teardown.sh infra/teardown.sh
+        echo "pinned teardown bundle $$generation matches; window ends $$window_end"
+
+  - id: terraform
+    name: hashicorp/terraform:1.16.3@sha256:c9a9d991c113f3bda5269de1506983d45ce1409dfe702df433acf10a5ea9f6bc
+    dir: infra/${_ROOT}
+    env: [TF_IN_AUTOMATION=1, TF_CLI_ARGS=-no-color]
+    entrypoint: sh
+    args:
+      - -c
+      - |
+        set -e
+        terraform fmt -check -recursive
+        terraform init -input=false
+        terraform validate
+        case "${_ACTION}" in
+          bundle) exit 0 ;;
+          destroy) terraform plan -input=false -lock-timeout=5m -destroy -out=/workspace/tfplan ;;
+          plan|apply) terraform plan -input=false -lock-timeout=5m -out=/workspace/tfplan ;;
+          *) echo "unknown action ${_ACTION}"; exit 1 ;;
+        esac
+        terraform show /workspace/tfplan > /workspace/plan.txt
+        if [ "${_ACTION}" != plan ]; then
+          terraform apply -input=false -lock-timeout=5m /workspace/tfplan
+        fi
+        rm /workspace/tfplan
+
+  - id: publish
+    name: gcr.io/cloud-builders/gcloud
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -e
+        prefix=gs://${PROJECT_ID}-build-source/terraform/${_ROOT}/${BUILD_ID}
+        gcloud storage cp infra/${_ROOT}/.terraform.lock.hcl "$$prefix/"
+        for file in plan.txt generation.txt; do
+          if [ -f "/workspace/$$file" ]; then gcloud storage cp "/workspace/$$file" "$$prefix/"; fi
+        done
+
+substitutions:
+  _ROOT: evidence
+  _ACTION: plan
+  _TFVARS: ""
+logsBucket: gs://${PROJECT_ID}-build-source/logs
+timeout: 3600s
+options:
+  logging: GCS_ONLY

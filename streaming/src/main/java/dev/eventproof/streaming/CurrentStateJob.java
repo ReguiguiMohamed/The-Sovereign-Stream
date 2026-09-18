@@ -1,62 +1,61 @@
 package dev.eventproof.streaming;
 
+import static dev.eventproof.streaming.KafkaSettings.require;
+
+import java.util.Properties;
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
-import org.apache.flink.connector.file.src.FileSource;
-import org.apache.flink.connector.file.src.reader.TextLineInputFormat;
-import org.apache.flink.core.fs.Path;
+import org.apache.flink.api.common.serialization.SimpleStringSchema;
+import org.apache.flink.connector.kafka.source.KafkaSource;
+import org.apache.flink.connector.kafka.source.enumerator.initializer.OffsetsInitializer;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 
-/** Minimal executable job for the current-state transition. */
+/**
+ * Kafka record-state topic to Bigtable current state. Checkpointing and restart
+ * behaviour come from the Flink cluster configuration.
+ */
 public final class CurrentStateJob {
     private CurrentStateJob() {}
 
-    public static DataStream<OperationalStateEvent> currentStateUpdates(
-            DataStream<OperationalStateEvent> events) {
+    /** Stable operator uid, so checkpointed state restores into the upgraded job. */
+    static final String STATE_UID = "preserve-newest-state";
+
+    public static DataStream<RecordStateEvent> currentStateUpdates(
+            DataStream<RecordStateEvent> events) {
         return events
-                .keyBy(OperationalStateEvent::getEntityId)
-                .process(new PreserveNewestState());
+                .keyBy(CurrentStateRow::rowKey)
+                .process(new PreserveNewestState())
+                .uid(STATE_UID)
+                .name(STATE_UID);
     }
 
     public static void main(String[] args) throws Exception {
         StreamExecutionEnvironment environment =
                 StreamExecutionEnvironment.getExecutionEnvironment();
-        environment.setParallelism(1);
-
-        DataStream<OperationalStateEvent> events;
-        if (args.length == 1) {
-            FileSource<String> source = FileSource
-                    .forRecordStreamFormat(new TextLineInputFormat(), new Path(args[0]))
-                    .build();
-            events = environment
-                    .fromSource(source, WatermarkStrategy.noWatermarks(), "operational-state-ndjson")
-                    .map(new ParseOperationalState());
-        } else if (args.length == 0) {
-            OperationalStateEvent newer = example(
-                    "a".repeat(64), 0, "2026-08-25T00:00:00Z", "completed");
-            OperationalStateEvent late = example(
-                    "b".repeat(64), 1, "2026-08-24T23:58:00Z", "processing");
-            events = environment.fromData(newer, newer, late);
-        } else {
-            throw new IllegalArgumentException("usage: CurrentStateJob [events.ndjson]");
-        }
-        currentStateUpdates(events).print();
-        environment.execute("eventproof-current-state-demo");
-    }
-
-    private static OperationalStateEvent example(
-            String eventId, int sequence, String eventTime, String state) {
-        return new OperationalStateEvent(
-                "operational-state.v1",
-                eventId,
-                "local-demo",
-                sequence,
-                "synthetic",
-                "resource",
-                "resource-0000",
-                "state.updated",
-                eventTime,
-                "2026-08-25T00:00:01Z",
-                state);
+        Properties kafka = KafkaSettings.fromEnvironment();
+        // Only committed producer transactions are processed.
+        kafka.setProperty("isolation.level", "read_committed");
+        // Checkpointed offsets take precedence on restore; a fresh job replays the
+        // retained topic, which the conditional writes make idempotent.
+        KafkaSource<String> source = KafkaSource.<String>builder()
+                .setProperties(kafka)
+                .setTopics(require("KAFKA_TOPIC"))
+                .setGroupId("current-state")
+                .setStartingOffsets(OffsetsInitializer.earliest())
+                .setValueOnlyDeserializer(new SimpleStringSchema())
+                .build();
+        DataStream<RecordStateEvent> events = environment
+                .fromSource(source, WatermarkStrategy.noWatermarks(), "record-state-topic")
+                .uid("record-state-topic")
+                .map(new ParseRecordState())
+                .uid("parse-record-state");
+        currentStateUpdates(events)
+                .sinkTo(new BigtableCurrentStateSink(
+                        require("BIGTABLE_PROJECT_ID"),
+                        require("BIGTABLE_INSTANCE_ID"),
+                        require("BIGTABLE_TABLE_ID"),
+                        System.getenv("BIGTABLE_EMULATOR_HOST")))
+                .uid("bigtable-current-state");
+        environment.execute("eventproof-current-state");
     }
 }

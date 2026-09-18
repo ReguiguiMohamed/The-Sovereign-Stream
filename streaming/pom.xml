@@ -29,20 +29,29 @@
   </dependencyManagement>
 
   <dependencies>
+    <!-- Provided by the Flink image at runtime. -->
     <dependency>
       <groupId>org.apache.flink</groupId>
       <artifactId>flink-streaming-java</artifactId>
       <version>${flink.version}</version>
+      <scope>provided</scope>
     </dependency>
     <dependency>
       <groupId>org.apache.flink</groupId>
       <artifactId>flink-clients</artifactId>
       <version>${flink.version}</version>
+      <scope>provided</scope>
     </dependency>
     <dependency>
       <groupId>org.apache.flink</groupId>
-      <artifactId>flink-connector-files</artifactId>
-      <version>${flink.version}</version>
+      <artifactId>flink-connector-kafka</artifactId>
+      <version>5.0.0-2.2</version>
+    </dependency>
+    <!-- Google's official SASL/OAUTHBEARER handler for Managed Kafka. -->
+    <dependency>
+      <groupId>com.google.cloud.hosted.kafka</groupId>
+      <artifactId>managed-kafka-auth-login-handler</artifactId>
+      <version>1.0.6</version>
     </dependency>
     <dependency>
       <groupId>com.fasterxml.jackson.core</groupId>
@@ -53,11 +62,16 @@
       <groupId>com.google.cloud</groupId>
       <artifactId>google-cloud-bigtable</artifactId>
     </dependency>
-    <!-- Bundles the official cbtemulator binary for linux/windows/darwin, so
-         `mvn verify` needs no Docker, no gcloud and no credentials. -->
+    <!-- Bundles the official cbtemulator binary, so tests need no Docker or credentials. -->
     <dependency>
       <groupId>com.google.cloud</groupId>
       <artifactId>google-cloud-bigtable-emulator</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.flink</groupId>
+      <artifactId>flink-connector-datagen</artifactId>
+      <version>${flink.version}</version>
       <scope>test</scope>
     </dependency>
     <dependency>
@@ -86,19 +100,37 @@
         <artifactId>maven-surefire-plugin</artifactId>
         <version>3.5.4</version>
       </plugin>
+      <!-- One jar for the Flink job, the producer and the API. -->
       <plugin>
-        <groupId>org.codehaus.mojo</groupId>
-        <artifactId>exec-maven-plugin</artifactId>
-        <version>3.6.3</version>
-        <configuration>
-          <executable>${java.home}/bin/java</executable>
-          <arguments>
-            <argument>-classpath</argument>
-            <classpath/>
-            <argument>dev.eventproof.streaming.CurrentStateJob</argument>
-            <argument>${events.file}</argument>
-          </arguments>
-        </configuration>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-shade-plugin</artifactId>
+        <version>3.6.2</version>
+        <executions>
+          <execution>
+            <phase>package</phase>
+            <goals>
+              <goal>shade</goal>
+            </goals>
+            <configuration>
+              <finalName>eventproof-streaming</finalName>
+              <createDependencyReducedPom>false</createDependencyReducedPom>
+              <filters>
+                <filter>
+                  <artifact>*:*</artifact>
+                  <excludes>
+                    <exclude>META-INF/*.SF</exclude>
+                    <exclude>META-INF/*.DSA</exclude>
+                    <exclude>META-INF/*.RSA</exclude>
+                  </excludes>
+                </filter>
+              </filters>
+              <transformers>
+                <!-- gRPC and Kafka discover implementations through service files. -->
+                <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+              </transformers>
+            </configuration>
+          </execution>
+        </executions>
       </plugin>
     </plugins>
   </build>

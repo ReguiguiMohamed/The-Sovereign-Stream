@@ -1,0 +1,60 @@
+# Installs the Flink Kubernetes Operator and applies the workloads, using the
+# evidence Terraform outputs. Run after an evidence apply:
+#   gcloud builds submit --config=deploy/cloudbuild.yaml ... \
+#     --substitutions=_SERVICE_IMAGE=<digest ref>,_FLINK_IMAGE=<digest ref>
+steps:
+  - id: outputs
+    name: hashicorp/terraform:1.16.3@sha256:c9a9d991c113f3bda5269de1506983d45ce1409dfe702df433acf10a5ea9f6bc
+    dir: infra/evidence
+    entrypoint: sh
+    args:
+      - -c
+      - terraform init -input=false -no-color > /dev/null && terraform output -json > /workspace/outputs.json
+
+  - id: deploy
+    name: gcr.io/cloud-builders/gcloud
+    entrypoint: bash
+    env:
+      - HELM_VERSION=v3.22.0
+      - HELM_SHA256=1e4ab49e429626cf6c6958d914248b78c9730803c2751b87627e171dc800e7bb
+      - CHART=https://archive.apache.org/dist/flink/flink-kubernetes-operator-1.15.0/flink-kubernetes-operator-1.15.0-helm.tgz
+      - CHART_SHA512=13076a6cbc92136da01aa67f4881ca2bb12d44697f782616b3f2e5b185e915cbb3ed7dd00de5b14ad81c408aebd7cbffa1611e96538d36389261780a75935781
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        cd /workspace
+        curl -fsSLo helm.tgz "https://get.helm.sh/helm-$${HELM_VERSION}-linux-amd64.tar.gz"
+        echo "$${HELM_SHA256}  helm.tgz" | sha256sum -c -
+        tar xzf helm.tgz linux-amd64/helm
+        curl -fsSLo chart.tgz "$${CHART}"
+        echo "$${CHART_SHA512}  chart.tgz" | sha512sum -c -
+
+        out() { python3 -c "import json,sys; print(json.load(open('outputs.json'))[sys.argv[1]]['value'])" "$$1"; }
+        accounts() { python3 -c "import json,sys; print(json.load(open('outputs.json'))['service_accounts']['value'][sys.argv[1]])" "$$1"; }
+
+        gcloud container clusters get-credentials "$$(out cluster)" \
+          --zone=europe-west1-b --project=${PROJECT_ID} --dns-endpoint
+        kubectl create namespace eventproof --dry-run=client -o yaml | kubectl apply -f -
+        linux-amd64/helm upgrade --install flink-kubernetes-operator chart.tgz \
+          --namespace flink-operator --create-namespace --wait \
+          --set webhook.create=false \
+          --set-json 'watchNamespaces=["eventproof"]' \
+          --set-json "jobServiceAccount.annotations={\"iam.gke.io/gcp-service-account\":\"$$(accounts flink)\"}"
+
+        export PROJECT_ID=${PROJECT_ID} SERVICE_IMAGE=${_SERVICE_IMAGE} FLINK_IMAGE=${_FLINK_IMAGE}
+        export KAFKA_BOOTSTRAP="$$(out kafka_bootstrap)" KAFKA_TOPIC="$$(out kafka_topic)"
+        export KAFKA_QUARANTINE_TOPIC="$$(out kafka_quarantine_topic)"
+        export BIGTABLE_INSTANCE="$$(out bigtable_instance)" BIGTABLE_TABLE="$$(out bigtable_table)"
+        export CHECKPOINT_BUCKET="$$(out checkpoint_bucket)" PRODUCER_ACCOUNT="$$(accounts producer)"
+        python3 -c "import os, sys; sys.stdout.write(os.path.expandvars(sys.stdin.read()))" \
+          < deploy/workloads.yaml | kubectl apply -f -
+        kubectl -n eventproof rollout status deployment/jetstream-producer --timeout=300s
+
+substitutions:
+  _SERVICE_IMAGE: ""
+  _FLINK_IMAGE: ""
+logsBucket: gs://${PROJECT_ID}-build-source/logs
+timeout: 1800s
+options:
+  logging: GCS_ONLY

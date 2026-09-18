@@ -1,0 +1,106 @@
+# Rendered by deploy/cloudbuild.yaml; ${...} values come from Terraform outputs
+# and the image build.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: producer
+  namespace: eventproof
+  annotations:
+    iam.gke.io/gcp-service-account: ${PRODUCER_ACCOUNT}
+---
+# One producer only; its transactional id also fences a stale instance.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jetstream-producer
+  namespace: eventproof
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: jetstream-producer
+  template:
+    metadata:
+      labels:
+        app: jetstream-producer
+    spec:
+      serviceAccountName: producer
+      securityContext:
+        runAsNonRoot: true
+      containers:
+        - name: producer
+          image: ${SERVICE_IMAGE}
+          args: [dev.eventproof.streaming.JetstreamProducer]
+          env:
+            - name: KAFKA_BOOTSTRAP
+              value: ${KAFKA_BOOTSTRAP}
+            - name: KAFKA_TOPIC
+              value: ${KAFKA_TOPIC}
+            - name: KAFKA_QUARANTINE_TOPIC
+              value: ${KAFKA_QUARANTINE_TOPIC}
+          resources:
+            requests:
+              cpu: 500m
+              memory: 768Mi
+            limits:
+              memory: 768Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: flink.apache.org/v1beta1
+kind: FlinkDeployment
+metadata:
+  name: current-state
+  namespace: eventproof
+spec:
+  image: ${FLINK_IMAGE}
+  flinkVersion: v2_2
+  serviceAccount: flink
+  flinkConfiguration:
+    taskmanager.numberOfTaskSlots: "2"
+    state.backend.type: rocksdb
+    execution.checkpointing.incremental: "true"
+    execution.checkpointing.interval: 30s
+    execution.checkpointing.dir: ${CHECKPOINT_BUCKET}/checkpoints
+    execution.checkpointing.savepoint-dir: ${CHECKPOINT_BUCKET}/savepoints
+    execution.checkpointing.externalized-checkpoint-retention: RETAIN_ON_CANCELLATION
+    high-availability.type: kubernetes
+    high-availability.storageDir: ${CHECKPOINT_BUCKET}/ha
+    restart-strategy.type: exponential-delay
+  jobManager:
+    resource:
+      cpu: 0.5
+      memory: 1600m
+  taskManager:
+    resource:
+      cpu: 1
+      memory: 3072m
+  podTemplate:
+    spec:
+      containers:
+        - name: flink-main-container
+          env:
+            - name: KAFKA_BOOTSTRAP
+              value: ${KAFKA_BOOTSTRAP}
+            - name: KAFKA_TOPIC
+              value: ${KAFKA_TOPIC}
+            - name: BIGTABLE_PROJECT_ID
+              value: ${PROJECT_ID}
+            - name: BIGTABLE_INSTANCE_ID
+              value: ${BIGTABLE_INSTANCE}
+            - name: BIGTABLE_TABLE_ID
+              value: ${BIGTABLE_TABLE}
+  job:
+    jarURI: local:///opt/flink/usrlib/eventproof-streaming.jar
+    entryClass: dev.eventproof.streaming.CurrentStateJob
+    parallelism: 2
+    upgradeMode: last-state

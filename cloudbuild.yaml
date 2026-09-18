@@ -1,0 +1,41 @@
+# Tests, the shaded jar, both images and their end-to-end smoke test.
+# Run from the repository root:
+#   gcloud builds submit --config=cloudbuild.yaml --region=europe-west1 \
+#     --project=eventproof-stream-2609 \
+#     --gcs-source-staging-dir=gs://eventproof-stream-2609-build-source/source \
+#     --service-account=projects/eventproof-stream-2609/serviceAccounts/cloud-build@eventproof-stream-2609.iam.gserviceaccount.com
+steps:
+  - id: verify
+    name: maven:3.9.11-eclipse-temurin-17@sha256:e4a7ace3dc0d645ed97f8d9ad0b0d3f0b14fa8d150138f27f116d7105a639b82
+    entrypoint: mvn
+    args: [--batch-mode, --no-transfer-progress, --file, streaming/pom.xml, verify]
+
+  - id: flink-job-image
+    name: gcr.io/cloud-builders/docker
+    args: [build, --target, flink-job, --tag, "${_REPOSITORY}/flink-job:${BUILD_ID}", streaming]
+
+  - id: service-image
+    name: gcr.io/cloud-builders/docker
+    args: [build, --target, service, --tag, "${_REPOSITORY}/service:${BUILD_ID}", streaming]
+
+  # Packaged images end to end against live Jetstream; see tools/image-smoke.sh.
+  - id: smoke
+    name: gcr.io/cloud-builders/docker
+    entrypoint: bash
+    args: [tools/image-smoke.sh]
+    env:
+      - FLINK_IMAGE=${_REPOSITORY}/flink-job:${BUILD_ID}
+      - SERVICE_IMAGE=${_REPOSITORY}/service:${BUILD_ID}
+
+images:
+  - ${_REPOSITORY}/flink-job:${BUILD_ID}
+  - ${_REPOSITORY}/service:${BUILD_ID}
+
+substitutions:
+  _REPOSITORY: europe-west1-docker.pkg.dev/${PROJECT_ID}/eventproof
+
+logsBucket: gs://${PROJECT_ID}-build-source/logs
+timeout: 2400s
+options:
+  logging: GCS_ONLY
+  dynamicSubstitutions: true

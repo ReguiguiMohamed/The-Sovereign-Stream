@@ -1,99 +1,55 @@
-# ADR 0002: Bigtable current-state materialization
+# ADR 0002: Bigtable current state
 
-Status: accepted for local implementation against the Bigtable emulator (EP-014).
-No GCP Bigtable instance exists. Sources accessed 26 August 2026:
-[emulator](https://docs.cloud.google.com/bigtable/docs/emulator),
-[schema design](https://docs.cloud.google.com/bigtable/docs/schema-design),
-[Java client](https://docs.cloud.google.com/java/docs/reference/google-cloud-bigtable/latest/overview).
+Status: accepted. Revised 17 September 2026: conditional writes replace cell
+timestamps as the ordering mechanism, and account markers were added.
+Sources: [schema design](https://docs.cloud.google.com/bigtable/docs/schema-design),
+[writes](https://docs.cloud.google.com/bigtable/docs/writes),
+[AT Protocol TIDs](https://atproto.com/specs/tid).
 
 ## Read pattern
 
-The query this table exists to serve is a point read: *what is the current state
-of one entity?* EP-015 will answer it with a single-row lookup by `entity_type`
-and `entity_id`. There is no scan, no range query and no secondary access path,
-so the schema is designed for one row read and nothing else.
+The current state of one record, by `entity_type` and `entity_id`. One request
+reads at most two rows: the record and its account. There is no scan on the read
+path.
 
 ## Contract
 
 | Element | Value |
 | --- | --- |
-| Table | runtime configuration, `current-state` in tests |
 | Row key | `escape(entity_type) + "#" + escape(entity_id)` |
-| Column family | `cs` |
-| Qualifier | `event` |
-| Cell value | the complete `operational-state.v1` event as contract JSON |
-| Cell timestamp | the event's `event_time`, as microseconds truncated to a whole millisecond |
-| Garbage collection | `maxVersions(1)` |
+| Column family | `cs`, garbage collection `maxVersions(1)` |
+| `event` | the complete `record-state.v1` event as JSON |
+| `revision` | the order key: a TID for records, the zero-padded sequence for account markers |
+| `seq` | the zero-padded `source_seq`, compared against a purge boundary |
+| `purge` | account rows only: the sequence up to which that account's records are removed |
+| Cell timestamp | 0; one version per cell, replaced by a later accepted write |
 
-### Row key
+Escaping replaces `%` with `%25`, then `#` with `%23`, so the one raw `#` is the
+separator and distinct pairs never collide. Flink keys its state with the same
+function.
 
-`entity_type` and `entity_id` are free-form non-empty strings, so plain
-`type + "#" + id` is not injective: `("a#b", "c")` and `("a", "b#c")` both produce
-`a#b#c`. Each component therefore has `%` escaped to `%25` and `#` to `%23`, in
-that order, before joining. After escaping neither component contains a raw `#`,
-so the single raw `#` is unambiguously the separator and distinct pairs always
-produce distinct keys.
+## Why conditional writes
 
-The key stays readable (`resource#resource-0000`). It is not hashed: hashing
-costs readability and is the remedy for a measured hotspot, which this project
-has not measured.
+Cell timestamps cannot carry the order. A Bigtable cell timestamp is a whole
+millisecond, while a TID holds microseconds and a clock id, so two different
+revisions of one record can map to one version and the last write would win
+regardless of revision.
 
-### Cell value
+Every write is therefore a check-and-mutate: the server compares the stored
+`revision` with the new one and applies the mutation only if the new one is
+greater. The comparison is on fixed-width, byte-ordered strings, so it is exact,
+and the row is the only synchronisation point. Concurrent writers, retries, a
+cold replay and expired Flink state all converge on the newest revision, and the
+same revision written twice is a no-op.
 
-The whole event is stored as one JSON cell rather than spread across a column per
-field, because the bounded query reads the whole event together. It is written
-with the same `EventJson` mapper the parser uses, so the stored JSON keeps the
-snake_case contract field names and reads back into the same type.
-`EventJson` is Jackson configured for that contract; it is not the canonical-JSON
-algorithm in `eventproof/event.py`, which is what produces the SHA-256 `event_id`,
-and the two are not interchangeable.
+Flink's keyed state sits in front of this to remove repeated writes. It is not
+what makes the result correct.
 
-### Cell timestamp and write semantics
+## Account markers
 
-The cell timestamp is `event_time`, never arrival time. Arrival time would make
-the newest write win, which is the failure this project exists to prevent.
-
-With `maxVersions(1)` and event-time cell timestamps, a mutation carrying an
-older `event_time` writes an older cell version and cannot become the newest
-cell, no matter when it arrives. Garbage collection is asynchronous, so an older
-cell may still be present after a newer one is written. The point read therefore
-does not trust collection to have run: it applies a server-side filter chain of
-family `cs`, qualifier `event` and `cellsPerColumn(1)`, so Bigtable returns only
-the newest cell and the client deserializes exactly one value.
-
-Bigtable expresses cell timestamps in microseconds, but a table is created with
-MILLIS granularity and the service rejects any timestamp that is not a whole
-millisecond. The Java admin client exposes no granularity setting, so the
-effective resolution is one millisecond: `cellTimestampMicros` truncates there
-deliberately. Two events inside the same millisecond collapse onto one cell and
-storage cannot order them.
-
-Writes are idempotent: row key, qualifier and cell timestamp are all derived from
-the event, so writing the same event twice produces the same single cell. This is
-idempotent materialization and newest-event-time visibility. It is **not**
-exactly-once delivery, and nothing here claims that.
-
-## Truth boundary
-
-Tested locally against the official bundled emulator. The emulator is in-memory:
-Google documents that its data does not persist across runs and that it is not
-for production use. This ADR therefore proves the data contract, the client
-behaviour and late-write materialization semantics. It proves nothing about
-durability across a restart, which stays with EP-016 and the controlled GCP
-evidence window.
-
-## Known limits
-
-- Equal `event_time` for the same entity: `PreserveNewestState` emits only on a
-  strictly newer `event_time`, so through the Flink path the first arrival wins
-  and the second never reaches Bigtable. A direct write of a second event at the
-  identical cell timestamp would overwrite the first. This is a recorded contract
-  limit, not a designed total ordering; defining one is deferred until a real
-  workload shows equal timestamps occur.
-- Cell versions resolve to one millisecond, not one microsecond. Two events for
-  one entity inside the same millisecond share a cell, and the later write wins
-  regardless of which has the newer `event_time`. Sub-millisecond ordering would
-  need a different cell layout, and no observed workload calls for one.
-- Throughput, row-key distribution and hotspot behaviour are unmeasured. A
-  workload-specific key distribution decision waits for production-shaped data.
-- One synchronous mutation per record. Batching is deferred to a measurement.
+An account event with `active: false, status: deleted`, and any sync event, raise
+`purge` on the account row to that event's sequence, then delete every record row
+of that account whose `seq` is at or below it, each delete conditional on that
+comparison so later records survive. Reads hide a record whose `seq` is at or
+below `purge`, and hide every record of an account whose stored status is not
+`active`, so a replayed stale create cannot resurface.

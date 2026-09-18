@@ -1,12 +1,12 @@
 package dev.eventproof.streaming;
 
+import static dev.eventproof.streaming.KafkaSettings.require;
+
 import com.google.cloud.bigtable.data.v2.BigtableDataClient;
-import com.google.cloud.bigtable.data.v2.BigtableDataSettings;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 import java.io.IOException;
 import java.io.OutputStream;
-import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
@@ -14,6 +14,8 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /**
  * Read-only current-state lookup for one entity: {@code GET
@@ -23,36 +25,43 @@ import java.util.Map;
  * scan, listing, pagination or mutation, so the query cost cannot grow with the
  * size of the table.
  *
- * <p>Binds to loopback. It carries no authentication because it is a local proof;
- * exposing it beyond loopback would need one first.
+ * <p>The service has no authentication of its own: on Cloud Run it is deployed
+ * without public access, so only IAM-authorized callers reach it.
  */
 public final class CurrentStateApi implements AutoCloseable {
     private static final String PATH = "/v1/current-state";
     private static final String JSON = "application/json; charset=utf-8";
+    /** Matches the Cloud Run concurrency setting, so requests never queue here. */
+    static final int WORKERS = 16;
 
     private final HttpServer server;
+    private final ExecutorService workers;
     private final BigtableDataClient client;
     private final String tableId;
 
-    private CurrentStateApi(HttpServer server, BigtableDataClient client, String tableId) {
+    private CurrentStateApi(
+            HttpServer server, ExecutorService workers, BigtableDataClient client, String tableId) {
         this.server = server;
+        this.workers = workers;
         this.client = client;
         this.tableId = tableId;
     }
 
-    /** {@code emulatorPort} of 0 means a real instance with the usual credentials. */
+    /** {@code emulatorHost} is {@code host:port}, or null for the real service. */
     public static CurrentStateApi start(
-            String projectId, String instanceId, String tableId, int httpPort, int emulatorPort)
+            String projectId,
+            String instanceId,
+            String tableId,
+            InetSocketAddress address,
+            String emulatorHost)
             throws IOException {
-        BigtableDataSettings.Builder settings = emulatorPort > 0
-                ? BigtableDataSettings.newBuilderForEmulator(emulatorPort)
-                : BigtableDataSettings.newBuilder();
         BigtableDataClient client = BigtableDataClient.create(
-                settings.setProjectId(projectId).setInstanceId(instanceId).build());
+                CurrentStateRow.settings(projectId, instanceId, emulatorHost));
 
-        HttpServer server = HttpServer.create(
-                new InetSocketAddress(InetAddress.getLoopbackAddress(), httpPort), 0);
-        CurrentStateApi api = new CurrentStateApi(server, client, tableId);
+        HttpServer server = HttpServer.create(address, 0);
+        ExecutorService workers = Executors.newFixedThreadPool(WORKERS);
+        server.setExecutor(workers);
+        CurrentStateApi api = new CurrentStateApi(server, workers, client, tableId);
         server.createContext(PATH, api::handle);
         server.start();
         return api;
@@ -62,9 +71,11 @@ public final class CurrentStateApi implements AutoCloseable {
         return server.getAddress().getPort();
     }
 
+    /** Stops accepting, lets in-flight requests finish within the Cloud Run grace period. */
     @Override
     public void close() {
-        server.stop(0);
+        server.stop(5);
+        workers.shutdown();
         client.close();
     }
 
@@ -87,7 +98,7 @@ public final class CurrentStateApi implements AutoCloseable {
                 respond(exchange, 400, "{\"error\":\"invalid_request\"}");
                 return;
             }
-            OperationalStateEvent current =
+            RecordStateEvent current =
                     CurrentStateRow.read(client, tableId, entityType, entityId);
             if (current == null) {
                 respond(exchange, 404, "{\"error\":\"not_found\"}");
@@ -139,28 +150,16 @@ public final class CurrentStateApi implements AutoCloseable {
         }
     }
 
+    /** Container entrypoint: listens on every interface at {@code PORT}. */
     public static void main(String[] args) throws IOException {
-        String emulatorHost = System.getenv("BIGTABLE_EMULATOR_HOST");
-        try (CurrentStateApi api = start(
+        CurrentStateApi api = start(
                 require("BIGTABLE_PROJECT_ID"),
                 require("BIGTABLE_INSTANCE_ID"),
                 require("BIGTABLE_TABLE_ID"),
-                Integer.parseInt(System.getenv().getOrDefault("PORT", "8080")),
-                emulatorHost == null
-                        ? 0
-                        : Integer.parseInt(emulatorHost.substring(emulatorHost.indexOf(':') + 1)))) {
-            System.out.println("current-state API on http://127.0.0.1:" + api.port() + PATH);
-            Thread.currentThread().join();
-        } catch (InterruptedException interrupted) {
-            Thread.currentThread().interrupt();
-        }
-    }
-
-    private static String require(String name) {
-        String value = System.getenv(name);
-        if (value == null || value.isBlank()) {
-            throw new IllegalStateException(name + " must be set");
-        }
-        return value;
+                new InetSocketAddress(Integer.parseInt(System.getenv().getOrDefault("PORT", "8080"))),
+                System.getenv("BIGTABLE_EMULATOR_HOST"));
+        // Cloud Run sends SIGTERM before stopping the instance.
+        Runtime.getRuntime().addShutdownHook(new Thread(api::close));
+        System.out.println("current-state API listening on port " + api.port());
     }
 }
