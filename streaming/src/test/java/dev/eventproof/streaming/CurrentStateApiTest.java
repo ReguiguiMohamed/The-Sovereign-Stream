@@ -23,6 +23,7 @@ import org.junit.After;
 import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
+import org.threeten.bp.Duration;
 
 /**
  * Query API contract tests against the bundled emulator and a loopback server, both
@@ -53,7 +54,8 @@ public class CurrentStateApiTest {
                         .setInstanceId(INSTANCE)
                         .build())) {
             admin.createTable(CreateTableRequest.of(TABLE)
-                    .addFamily(CurrentStateRow.FAMILY, GCRULES.maxVersions(1)));
+                    .addFamily(CurrentStateRow.FAMILY, GCRULES.maxVersions(1))
+                    .addFamily(CurrentStateRow.ACTIVITY, GCRULES.maxAge(Duration.ofHours(1))));
         }
         data = BigtableDataClient.create(CurrentStateRow.settings(PROJECT, INSTANCE, host()));
         api = CurrentStateApi.start(PROJECT, INSTANCE, TABLE, LOOPBACK, host());
@@ -161,6 +163,49 @@ public class CurrentStateApiTest {
         assertEquals(200, get("account", Records.DID).statusCode());
     }
 
+    /**
+     * The feed is ordered by receive time and reports each entity as its row now
+     * reads, so a record the account hides leaves the feed instead of being listed.
+     */
+    @Test
+    public void activityIsNewestFirstAndDropsWhatTheRowHides() throws Exception {
+        RecordStateEvent older = Records.post(Records.OLDER, "create");
+        older.receivedAt = "2026-09-17T16:34:34.100Z";
+        RecordStateEvent newer =
+                Records.record(ENTITY_TYPE, Records.DID + "/3mvq3hy4fsl2m", Records.OLDER, "create");
+        newer.receivedAt = "2026-09-17T16:34:35.100Z";
+        try (BigtableCurrentStateSink.Writer writer = new BigtableCurrentStateSink.Writer(
+                BigtableDataClient.create(CurrentStateRow.settings(PROJECT, INSTANCE, host())),
+                TABLE)) {
+            writer.write(older, null);
+            writer.write(newer, null);
+            writer.flush(false);
+        }
+
+        String body = send(HttpRequest.newBuilder(activity(10)).GET().build()).body();
+        assertTrue(body, body.contains("\"latest_event_at\":\"2026-09-17T16:34:35.100Z\""));
+        assertTrue(body, body.indexOf(newer.entityId) < body.indexOf(older.entityId));
+
+        write(Records.account(Records.DID, 40, "deactivated"));
+
+        body = send(HttpRequest.newBuilder(activity(10)).GET().build()).body();
+        assertTrue(body, body.contains("\"records\":[]"));
+    }
+
+    @Test
+    public void theDashboardIsServedAtTheRoot() throws Exception {
+        HttpResponse<String> response = send(HttpRequest
+                .newBuilder(URI.create("http://127.0.0.1:" + api.port() + "/"))
+                .GET()
+                .build());
+
+        assertEquals(200, response.statusCode());
+        assertEquals(
+                "text/html; charset=utf-8",
+                response.headers().firstValue("Content-Type").orElseThrow());
+        assertTrue(response.body().contains("/v1/activity"));
+    }
+
     @Test
     public void closingTheApiStopsTheListener() throws Exception {
         CurrentStateApi extra =
@@ -187,6 +232,10 @@ public class CurrentStateApiTest {
 
     private URI uri(String query) {
         return URI.create("http://127.0.0.1:" + api.port() + "/v1/current-state" + query);
+    }
+
+    private URI activity(int limit) {
+        return URI.create("http://127.0.0.1:" + api.port() + "/v1/activity?limit=" + limit);
     }
 
     private static String encode(String value) {

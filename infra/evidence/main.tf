@@ -199,6 +199,11 @@ resource "google_bigtable_table" "current_state" {
   column_family {
     family = "cs"
   }
+
+  # Recent-activity index rows; see CurrentStateRow.
+  column_family {
+    family = "act"
+  }
 }
 
 resource "google_bigtable_gc_policy" "current_state" {
@@ -207,6 +212,15 @@ resource "google_bigtable_gc_policy" "current_state" {
   column_family   = "cs"
   deletion_policy = "ABANDON"
   gc_rules        = jsonencode({ rules = [{ max_version = 1 }] })
+}
+
+# The index is a rolling window, so its rows expire instead of accumulating.
+resource "google_bigtable_gc_policy" "activity" {
+  instance_name   = var.bigtable_instance
+  table           = google_bigtable_table.current_state.name
+  column_family   = "act"
+  deletion_policy = "ABANDON"
+  gc_rules        = jsonencode({ rules = [{ max_age = "1h" }] })
 }
 
 # Flink checkpoints and savepoints.

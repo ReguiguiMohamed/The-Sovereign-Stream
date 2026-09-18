@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<title>EventProof current state</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 14px/1.5 system-ui, sans-serif; margin: 0; padding: 24px; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  p.sub { margin: 0 0 20px; opacity: .7; }
+  .cards { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 20px; }
+  .card { border: 1px solid; border-radius: 8px; padding: 10px 14px; min-width: 130px; }
+  .card b { display: block; font-size: 22px; font-weight: 600; }
+  .card span { opacity: .7; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { text-align: left; padding: 5px 10px 5px 0; border-bottom: 1px solid; }
+  th { opacity: .7; font-weight: 500; }
+  tr[data-entity] { cursor: pointer; }
+  code { font-family: ui-monospace, monospace; }
+  pre { border: 1px solid; border-radius: 8px; padding: 12px; overflow: auto; }
+  #error { color: #b00; }
+</style>
+
+<h1>EventProof — current record state</h1>
+<p class="sub">
+  Live from the query API: <code>/v1/activity</code> reads the recent-activity
+  index, then one point read per entity. Clicking a row calls
+  <code>/v1/current-state</code> for that entity alone.
+</p>
+
+<div class="cards">
+  <div class="card"><b id="lag">–</b><span>source lag</span></div>
+  <div class="card"><b id="age">–</b><span>index freshness</span></div>
+  <div class="card"><b id="served">–</b><span>entities served</span></div>
+  <div class="card"><b id="types">–</b><span>record types</span></div>
+</div>
+
+<p id="error"></p>
+<table>
+  <thead><tr><th>entity type</th><th>entity id</th><th>event</th><th>revision</th><th>event time</th></tr></thead>
+  <tbody id="rows"></tbody>
+</table>
+<pre id="detail" hidden></pre>
+
+<script>
+  const $ = id => document.getElementById(id);
+  const seconds = ms => ms < 1000 ? Math.round(ms) + " ms" : (ms / 1000).toFixed(1) + " s";
+
+  async function json(path) {
+    const response = await fetch(path);
+    if (!response.ok) throw new Error(path + " returned " + response.status);
+    return response.json();
+  }
+
+  async function refresh() {
+    try {
+      const activity = await json("/v1/activity?limit=50");
+      $("error").textContent = "";
+      const observed = Date.parse(activity.observed_at);
+      const records = activity.records;
+
+      $("age").textContent = activity.latest_event_at
+        ? seconds(observed - Date.parse(activity.latest_event_at)) : "–";
+      // Bluesky's own timestamp on the newest record we serve, against our clock.
+      const newest = records.reduce(
+        (max, r) => Math.max(max, Date.parse(r.event_time)), 0);
+      $("lag").textContent = newest ? seconds(observed - newest) : "–";
+      $("served").textContent = records.length;
+      $("types").textContent = new Set(records.map(r => r.entity_type)).size;
+
+      $("rows").replaceChildren(...records.map(record => {
+        const row = document.createElement("tr");
+        row.dataset.entity = record.entity_type + "\t" + record.entity_id;
+        for (const cell of [record.entity_type, record.entity_id,
+                            record.event_type, record.revision, record.event_time]) {
+          const td = document.createElement("td");
+          td.textContent = cell;
+          row.append(td);
+        }
+        return row;
+      }));
+    } catch (failure) {
+      $("error").textContent = failure.message;
+    }
+  }
+
+  $("rows").addEventListener("click", async event => {
+    const row = event.target.closest("tr[data-entity]");
+    if (!row) return;
+    const [type, id] = row.dataset.entity.split("\t");
+    const query = "entity_type=" + encodeURIComponent(type)
+      + "&entity_id=" + encodeURIComponent(id);
+    const detail = $("detail");
+    detail.hidden = false;
+    detail.textContent = "GET /v1/current-state?" + query + "\n\n"
+      + JSON.stringify(await json("/v1/current-state?" + query), null, 2);
+  });
+
+  refresh();
+  setInterval(refresh, 5000);
+</script>

@@ -67,6 +67,7 @@ project_role $BUILD roles/cloudscheduler.admin                  # teardown job; 
 project_role $BUILD roles/cloudbuild.builds.viewer              # teardown overlap check
 project_role $BUILD roles/monitoring.alertPolicyEditor          # teardown failure alert
 project_role $BUILD roles/monitoring.notificationChannelEditor  # alert e-mail channel
+project_role $BUILD roles/logging.configWriter                  # log-based alert condition
 # Checkpoint bucket only. Creating a bucket is authorised on the project, which
 # provides no bucket resource.name, so a bare startsWith would deny the create.
 # The condition therefore restricts buckets and objects and leaves the rest of

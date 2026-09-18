@@ -34,6 +34,7 @@ import org.junit.Before;
 import org.junit.ClassRule;
 import org.junit.Rule;
 import org.junit.Test;
+import org.threeten.bp.Duration;
 
 /** Bigtable row contract tests against the official bundled emulator. */
 public class BigtableCurrentStateTest {
@@ -63,7 +64,8 @@ public class BigtableCurrentStateTest {
                         .setInstanceId(INSTANCE)
                         .build())) {
             admin.createTable(CreateTableRequest.of(TABLE)
-                    .addFamily(CurrentStateRow.FAMILY, GCRULES.maxVersions(1)));
+                    .addFamily(CurrentStateRow.FAMILY, GCRULES.maxVersions(1))
+                    .addFamily(CurrentStateRow.ACTIVITY, GCRULES.maxAge(Duration.ofHours(1))));
         }
         data = BigtableDataClient.create(CurrentStateRow.settings(PROJECT, INSTANCE, host()));
     }

@@ -11,9 +11,11 @@ import com.google.cloud.bigtable.data.v2.models.Mutation;
 import com.google.cloud.bigtable.data.v2.models.Query;
 import com.google.cloud.bigtable.data.v2.models.Row;
 import com.google.cloud.bigtable.data.v2.models.RowCell;
+import com.google.cloud.bigtable.data.v2.models.RowMutation;
 import com.google.cloud.bigtable.data.v2.models.TableId;
 import com.google.protobuf.ByteString;
 import java.io.IOException;
+import java.time.Instant;
 import java.util.HashMap;
 import java.util.Map;
 
@@ -31,6 +33,13 @@ final class CurrentStateRow {
     static final String REVISION = "revision";
     static final String SEQ = "seq";
     static final String PURGE = "purge";
+    /** Recent-activity index: one row per event, newest first, expired by age. */
+    static final String ACTIVITY = "act";
+    static final String KEY = "k";
+    private static final String ACTIVITY_PREFIX = "~act#";
+    // '~' sorts after every entity type, so the index never collides with state.
+    private static final int ACTIVITY_DIGITS = 14;
+    private static final long HORIZON = 99_999_999_999_999L;
     // One version per cell: a later successful write replaces it.
     private static final long VERSION = 0;
 
@@ -53,9 +62,50 @@ final class CurrentStateRow {
         return component.replace("%", "%25").replace("#", "%23");
     }
 
+    /** Reverses {@link #rowKey}: entity type, then entity id. */
+    static String[] parseRowKey(String key) {
+        int hash = key.indexOf('#');
+        return new String[] {unescape(key.substring(0, hash)), unescape(key.substring(hash + 1))};
+    }
+
+    private static String unescape(String component) {
+        return component.replace("%23", "#").replace("%25", "%");
+    }
+
     /** Fixed width, so byte order is numeric order. */
     static String padded(long seq) {
         return String.format("%020d", seq);
+    }
+
+    /**
+     * Index key for one event: the complement of its receive time, so a plain
+     * prefix read returns the most recent events first without a table scan.
+     */
+    static String activityKey(RecordStateEvent event) {
+        long millis = Instant.parse(event.receivedAt).toEpochMilli();
+        return ACTIVITY_PREFIX
+                + String.format("%0" + ACTIVITY_DIGITS + "d", HORIZON - millis)
+                + "#" + event.eventId.substring(0, 12);
+    }
+
+    static Instant activityTime(String activityKey) {
+        int start = ACTIVITY_PREFIX.length();
+        return Instant.ofEpochMilli(HORIZON
+                - Long.parseLong(activityKey.substring(start, start + ACTIVITY_DIGITS)));
+    }
+
+    /** Records which row the event touched; the row itself stays authoritative. */
+    static RowMutation activity(String tableId, RecordStateEvent event) {
+        return RowMutation.create(TableId.of(tableId), activityKey(event))
+                .setCell(ACTIVITY, KEY, VERSION, rowKey(event));
+    }
+
+    /** The newest {@code limit} index rows. */
+    static Query recent(String tableId, int limit) {
+        return Query.create(TableId.of(tableId))
+                .prefix(ACTIVITY_PREFIX)
+                .filter(column(ACTIVITY, KEY))
+                .limit(limit);
     }
 
     static boolean purges(RecordStateEvent event) {
@@ -164,9 +214,14 @@ final class CurrentStateRow {
     }
 
     private static Filter column(String qualifier) {
+        return column(FAMILY, qualifier);
+    }
+
+    private static Filter column(String family, String qualifier) {
         return FILTERS.chain()
-                .filter(FILTERS.family().exactMatch(FAMILY))
-                .filter(FILTERS.qualifier().exactMatch(qualifier));
+                .filter(FILTERS.family().exactMatch(family))
+                .filter(FILTERS.qualifier().exactMatch(qualifier))
+                .filter(FILTERS.limit().cellsPerColumn(1));
     }
 
     private static Filter atLeast(String qualifier, String value) {

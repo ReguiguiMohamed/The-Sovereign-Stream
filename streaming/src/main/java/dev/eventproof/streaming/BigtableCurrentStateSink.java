@@ -1,9 +1,9 @@
 package dev.eventproof.streaming;
 
+import com.google.api.core.ApiFuture;
 import com.google.api.core.ApiFutureCallback;
 import com.google.api.core.ApiFutures;
 import com.google.cloud.bigtable.data.v2.BigtableDataClient;
-import com.google.cloud.bigtable.data.v2.models.ConditionalRowMutation;
 import com.google.common.util.concurrent.MoreExecutors;
 import java.io.IOException;
 import java.util.concurrent.Semaphore;
@@ -73,15 +73,18 @@ public final class BigtableCurrentStateSink implements Sink<RecordStateEvent> {
                 CurrentStateRow.purgeRecords(client, tableId, event);
             }
             if (!JetstreamMapping.SYNC.equals(event.entityType)) {
-                submit(CurrentStateRow.write(tableId, event));
+                submit(client.checkAndMutateRowAsync(CurrentStateRow.write(tableId, event)));
+                // The index only names the row; what the API serves is still read
+                // from the row itself, so a purge hides the record here too.
+                submit(client.mutateRowAsync(CurrentStateRow.activity(tableId, event)));
             }
         }
 
-        private void submit(ConditionalRowMutation mutation) throws InterruptedException {
+        private void submit(ApiFuture<?> write) throws InterruptedException {
             inFlight.acquire();
             ApiFutures.addCallback(
-                    client.checkAndMutateRowAsync(mutation),
-                    new ApiFutureCallback<Boolean>() {
+                    write,
+                    new ApiFutureCallback<Object>() {
                         @Override
                         public void onFailure(Throwable error) {
                             failure.compareAndSet(null, error);
@@ -89,7 +92,7 @@ public final class BigtableCurrentStateSink implements Sink<RecordStateEvent> {
                         }
 
                         @Override
-                        public void onSuccess(Boolean ignored) {
+                        public void onSuccess(Object ignored) {
                             inFlight.release();
                         }
                     },

@@ -58,7 +58,7 @@ done
 # The emulators image ships the emulator but not cbt.
 docker exec bigtable gcloud components install cbt --quiet >/dev/null
 docker exec -e BIGTABLE_EMULATOR_HOST=localhost:8086 bigtable \
-  cbt -project smoke -instance smoke createtable current-state families=cs:maxversions=1
+  cbt -project smoke -instance smoke createtable current-state families=cs:maxversions=1,act:maxage=1h
 docker exec -e BIGTABLE_EMULATOR_HOST=localhost:8086 bigtable \
   cbt -project smoke -instance smoke ls | grep -qx current-state || fail "no emulator table"
 
