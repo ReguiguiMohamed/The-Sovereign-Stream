@@ -61,7 +61,7 @@ account_role "$(account teardown-scheduler)" $BUILD roles/iam.serviceAccountUser
 # Calling the private API needs an identity token, which Cloud Build's metadata
 # server does not serve, so the build mints one for itself:
 # https://cloud.google.com/iam/docs/create-short-lived-credentials-direct
-account_role "$BUILD" $BUILD roles/iam.serviceAccountTokenCreator
+account_role "$BUILD" $BUILD roles/iam.serviceAccountOpenIdTokenCreator
 
 # Deployment identity, project level, one purpose each.
 project_role $BUILD roles/compute.networkAdmin                  # VPC, subnet, router, NAT
