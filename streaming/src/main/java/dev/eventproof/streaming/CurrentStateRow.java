@@ -15,6 +15,7 @@ import com.google.cloud.bigtable.data.v2.models.RowMutation;
 import com.google.cloud.bigtable.data.v2.models.TableId;
 import com.google.protobuf.ByteString;
 import java.io.IOException;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.HashMap;
 import java.util.Map;
@@ -40,6 +41,10 @@ final class CurrentStateRow {
     // '~' sorts after every entity type, so the index never collides with state.
     private static final int ACTIVITY_DIGITS = 14;
     private static final long HORIZON = 99_999_999_999_999L;
+    /** Matches the act family's max-age rule; reads apply it too, because GC is lazy. */
+    static final Duration ACTIVITY_WINDOW = Duration.ofHours(1);
+    // Bigtable cell timestamps are microseconds, at millisecond granularity.
+    private static final long MICROS = 1000;
     // One version per cell: a later successful write replaces it.
     private static final long VERSION = 0;
 
@@ -82,10 +87,13 @@ final class CurrentStateRow {
      * prefix read returns the most recent events first without a table scan.
      */
     static String activityKey(RecordStateEvent event) {
-        long millis = Instant.parse(event.receivedAt).toEpochMilli();
         return ACTIVITY_PREFIX
-                + String.format("%0" + ACTIVITY_DIGITS + "d", HORIZON - millis)
+                + String.format("%0" + ACTIVITY_DIGITS + "d", HORIZON - receivedMillis(event))
                 + "#" + event.eventId.substring(0, 12);
+    }
+
+    private static long receivedMillis(RecordStateEvent event) {
+        return Instant.parse(event.receivedAt).toEpochMilli();
     }
 
     static Instant activityTime(String activityKey) {
@@ -94,17 +102,30 @@ final class CurrentStateRow {
                 - Long.parseLong(activityKey.substring(start, start + ACTIVITY_DIGITS)));
     }
 
-    /** Records which row the event touched; the row itself stays authoritative. */
+    /**
+     * Records which row the event touched; the row itself stays authoritative. The
+     * cell carries the event's own receive time, which is what the family's max-age
+     * rule measures, and makes a retried write replace its cell rather than add one.
+     */
     static RowMutation activity(String tableId, RecordStateEvent event) {
         return RowMutation.create(TableId.of(tableId), activityKey(event))
-                .setCell(ACTIVITY, KEY, VERSION, rowKey(event));
+                .setCell(ACTIVITY, KEY, receivedMillis(event) * MICROS, rowKey(event));
     }
 
-    /** The newest {@code limit} index rows. */
-    static Query recent(String tableId, int limit) {
+    /**
+     * The newest {@code limit} index rows received within {@link #ACTIVITY_WINDOW} of
+     * {@code now}. Garbage collection is asynchronous, so the window is a read filter
+     * as well as a retention rule; a row whose cell falls outside it is not returned.
+     */
+    static Query recent(String tableId, int limit, Instant now) {
+        long cutoff = now.minus(ACTIVITY_WINDOW).toEpochMilli() * MICROS;
         return Query.create(TableId.of(tableId))
                 .prefix(ACTIVITY_PREFIX)
-                .filter(column(ACTIVITY, KEY))
+                .filter(FILTERS.chain()
+                        .filter(FILTERS.family().exactMatch(ACTIVITY))
+                        .filter(FILTERS.qualifier().exactMatch(KEY))
+                        .filter(FILTERS.timestamp().range().startClosed(cutoff))
+                        .filter(FILTERS.limit().cellsPerColumn(1)))
                 .limit(limit);
     }
 

@@ -141,9 +141,10 @@ public final class CurrentStateApi implements AutoCloseable {
      * currently reads, so a purged or hidden record is left out rather than listed.
      */
     private String activity(int limit) throws IOException {
+        Instant now = Instant.now();
         Set<String> keys = new LinkedHashSet<>();
         Instant latest = null;
-        for (Row row : client.readRows(CurrentStateRow.recent(tableId, limit))) {
+        for (Row row : client.readRows(CurrentStateRow.recent(tableId, limit, now))) {
             if (latest == null) {
                 latest = CurrentStateRow.activityTime(row.getKey().toStringUtf8());
             }
@@ -162,7 +163,7 @@ public final class CurrentStateApi implements AutoCloseable {
             }
             records.append(EventJson.write(current));
         }
-        return "{\"observed_at\":\"" + Instant.now()
+        return "{\"observed_at\":\"" + now
                 + "\",\"latest_event_at\":"
                 + (latest == null ? "null" : "\"" + latest + "\"")
                 + ",\"records\":" + records.append(']') + "}";

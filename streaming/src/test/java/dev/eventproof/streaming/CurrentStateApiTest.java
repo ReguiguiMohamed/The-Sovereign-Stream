@@ -2,6 +2,7 @@ package dev.eventproof.streaming;
 
 import static com.google.cloud.bigtable.admin.v2.models.GCRules.GCRULES;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
@@ -19,6 +20,9 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
+import java.time.Instant;
+import java.time.temporal.ChronoUnit;
+import java.util.List;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Rule;
@@ -164,32 +168,44 @@ public class CurrentStateApiTest {
     }
 
     /**
-     * The feed is ordered by receive time and reports each entity as its row now
-     * reads, so a record the account hides leaves the feed instead of being listed.
+     * The feed is ordered by receive time, holds only entries inside the retention
+     * window whatever asynchronous collection has done with the rows, and reports each
+     * entity as its row now reads, so a record the account hides leaves the feed.
      */
     @Test
-    public void activityIsNewestFirstAndDropsWhatTheRowHides() throws Exception {
-        RecordStateEvent older = Records.post(Records.OLDER, "create");
-        older.receivedAt = "2026-09-17T16:34:34.100Z";
-        RecordStateEvent newer =
-                Records.record(ENTITY_TYPE, Records.DID + "/3mvq3hy4fsl2m", Records.OLDER, "create");
-        newer.receivedAt = "2026-09-17T16:34:35.100Z";
+    public void activityIsNewestFirstWindowedAndDropsWhatTheRowHides() throws Exception {
+        Instant now = Instant.now();
+        RecordStateEvent expired = received(Records.DID + "/3mvq3hy4fsl2n",
+                now.minus(CurrentStateRow.ACTIVITY_WINDOW).minusSeconds(60));
+        RecordStateEvent older = received(Records.POST_ID, now.minusSeconds(120));
+        RecordStateEvent newer = received(Records.DID + "/3mvq3hy4fsl2m", now.minusSeconds(60));
         try (BigtableCurrentStateSink.Writer writer = new BigtableCurrentStateSink.Writer(
                 BigtableDataClient.create(CurrentStateRow.settings(PROJECT, INSTANCE, host())),
                 TABLE)) {
-            writer.write(older, null);
-            writer.write(newer, null);
+            for (RecordStateEvent event : List.of(expired, older, newer)) {
+                writer.write(event, null);
+            }
             writer.flush(false);
         }
 
         String body = send(HttpRequest.newBuilder(activity(10)).GET().build()).body();
-        assertTrue(body, body.contains("\"latest_event_at\":\"2026-09-17T16:34:35.100Z\""));
+        assertTrue(body, body.contains("\"latest_event_at\":\"" + newer.receivedAt + "\""));
         assertTrue(body, body.indexOf(newer.entityId) < body.indexOf(older.entityId));
+        // Its row is still there; the read window is what leaves it out.
+        assertFalse(body, body.contains(expired.entityId));
 
         write(Records.account(Records.DID, 40, "deactivated"));
 
         body = send(HttpRequest.newBuilder(activity(10)).GET().build()).body();
         assertTrue(body, body.contains("\"records\":[]"));
+    }
+
+    /** Milliseconds, because that is the precision a cell timestamp keeps. */
+    private static RecordStateEvent received(String entityId, Instant at) {
+        RecordStateEvent event =
+                Records.record(ENTITY_TYPE, entityId, Records.OLDER, "create");
+        event.receivedAt = at.truncatedTo(ChronoUnit.MILLIS).toString();
+        return event;
     }
 
     @Test

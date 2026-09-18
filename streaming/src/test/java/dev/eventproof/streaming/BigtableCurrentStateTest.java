@@ -19,9 +19,12 @@ import com.google.cloud.bigtable.admin.v2.BigtableTableAdminClient;
 import com.google.cloud.bigtable.admin.v2.BigtableTableAdminSettings;
 import com.google.cloud.bigtable.admin.v2.models.CreateTableRequest;
 import com.google.cloud.bigtable.data.v2.BigtableDataClient;
+import com.google.cloud.bigtable.data.v2.models.Row;
+import com.google.cloud.bigtable.data.v2.models.RowCell;
 import com.google.cloud.bigtable.data.v2.models.TableId;
 import com.google.cloud.bigtable.emulator.v2.BigtableEmulatorRule;
 import java.io.IOException;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -156,6 +159,25 @@ public class BigtableCurrentStateTest {
         RecordStateEvent visible = CurrentStateRow.read(data, TABLE, POST, after.entityId);
         assertNotNull(visible);
         assertEquals(after.eventId, visible.eventId);
+    }
+
+    /**
+     * The index cell is stamped with the event's receive time. A zero timestamp reads
+     * as 1970, which the act family's one-hour max-age rule treats as long expired.
+     */
+    @Test
+    public void theActivityCellCarriesTheReceiveTime() throws Exception {
+        RecordStateEvent event = post(OLDER, "create");
+        try (BigtableCurrentStateSink.Writer writer = writer()) {
+            writer.write(event, null);
+            writer.flush(false);
+        }
+
+        Row row = data.readRow(TableId.of(TABLE), CurrentStateRow.activityKey(event));
+        assertNotNull(row);
+        RowCell cell = row.getCells(CurrentStateRow.ACTIVITY, CurrentStateRow.KEY).get(0);
+        assertEquals(Instant.parse(event.receivedAt).toEpochMilli() * 1000, cell.getTimestamp());
+        assertEquals(CurrentStateRow.rowKey(event), cell.getValue().toStringUtf8());
     }
 
     /** A rejected mutation fails the flush, so the checkpoint that needs it fails. */

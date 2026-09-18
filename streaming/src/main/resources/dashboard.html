@@ -1,99 +1,370 @@
 <!DOCTYPE html>
+<html lang="en">
 <meta charset="utf-8">
-<title>EventProof current state</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EventProof — live record state</title>
 <style>
-  :root { color-scheme: light dark; }
-  body { font: 14px/1.5 system-ui, sans-serif; margin: 0; padding: 24px; }
-  h1 { font-size: 18px; margin: 0 0 4px; }
-  p.sub { margin: 0 0 20px; opacity: .7; }
-  .cards { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 20px; }
-  .card { border: 1px solid; border-radius: 8px; padding: 10px 14px; min-width: 130px; }
-  .card b { display: block; font-size: 22px; font-weight: 600; }
-  .card span { opacity: .7; }
-  table { border-collapse: collapse; width: 100%; }
-  th, td { text-align: left; padding: 5px 10px 5px 0; border-bottom: 1px solid; }
-  th { opacity: .7; font-weight: 500; }
-  tr[data-entity] { cursor: pointer; }
-  code { font-family: ui-monospace, monospace; }
-  pre { border: 1px solid; border-radius: 8px; padding: 12px; overflow: auto; }
-  #error { color: #b00; }
+  /* One accent, two greys, sized in a single scale. */
+  :root {
+    color-scheme: light dark;
+    --bg: #fbfbfc;
+    --panel: #ffffff;
+    --line: #e2e4e9;
+    --ink: #16181d;
+    --muted: #61656e;
+    --accent: #1a56b8;
+    --warn: #8a5300;
+    --bad: #9b1c1c;
+    --radius: 10px;
+    --gap: 16px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #111317; --panel: #181b21; --line: #2a2f38;
+      --ink: #e9ebef; --muted: #9aa0ab; --accent: #7fa9f0;
+      --warn: #e0a955; --bad: #f0908c;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 28px clamp(16px, 4vw, 40px) 56px;
+    background: var(--bg);
+    color: var(--ink);
+    font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 1120px; margin: 0 auto; }
+  h1 { font-size: 20px; font-weight: 650; letter-spacing: -.01em; margin: 0; }
+  h2 { font-size: 13px; font-weight: 600; text-transform: uppercase;
+       letter-spacing: .06em; color: var(--muted); margin: 28px 0 10px; }
+  p.lede { margin: 6px 0 0; color: var(--muted); max-width: 62ch; }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, "Cascadia Mono", Menlo, monospace;
+                font-size: .92em; }
+
+  .bar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
+         margin-top: 20px; padding-bottom: 14px; border-bottom: 1px solid var(--line); }
+  .bar .spacer { flex: 1 1 auto; }
+  button, select {
+    font: inherit; color: inherit; background: var(--panel);
+    border: 1px solid var(--line); border-radius: 8px; padding: 6px 12px; cursor: pointer;
+  }
+  button:hover, select:hover { border-color: var(--accent); }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
+  label { color: var(--muted); }
+
+  #status { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+            margin: 14px 0 0; color: var(--muted); min-height: 1.55em; }
+  .badge { border-radius: 999px; padding: 1px 9px; font-size: 12.5px; font-weight: 600;
+           border: 1px solid currentColor; }
+  .badge.live { color: var(--accent); }
+  .badge.paused, .badge.stale { color: var(--warn); }
+  .badge.error { color: var(--bad); }
+
+  .figures { display: grid; gap: var(--gap); margin-top: 14px;
+             grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
+  .figure { background: var(--panel); border: 1px solid var(--line);
+            border-radius: var(--radius); padding: 14px 16px; }
+  .figure dt { font-size: 13px; color: var(--muted); font-weight: 500; }
+  .figure dd { margin: 4px 0 0; font-size: 26px; font-weight: 600; letter-spacing: -.02em;
+               font-variant-numeric: tabular-nums; }
+  .figure .note { display: block; margin-top: 6px; font-size: 12.5px;
+                  color: var(--muted); font-weight: 400; letter-spacing: 0; }
+
+  .types { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 0; padding: 0; list-style: none; }
+  .types li { border: 1px solid var(--line); border-radius: 999px;
+              padding: 2px 10px; font-size: 13px; }
+  .types b { font-variant-numeric: tabular-nums; }
+
+  .scroll { overflow-x: auto; border: 1px solid var(--line);
+            border-radius: var(--radius); background: var(--panel); }
+  table { border-collapse: collapse; width: 100%; min-width: 720px; }
+  caption { text-align: left; padding: 12px 16px; color: var(--muted); font-size: 13px; }
+  th, td { text-align: left; padding: 9px 16px; border-top: 1px solid var(--line);
+           white-space: nowrap; }
+  th { font-size: 12.5px; font-weight: 600; color: var(--muted); }
+  td.num { font-variant-numeric: tabular-nums; }
+  tr[aria-current="true"] { background: color-mix(in srgb, var(--accent) 10%, transparent); }
+  .link { background: none; border: 0; padding: 0; color: var(--accent);
+          text-decoration: underline; text-underline-offset: 2px; }
+  .empty { padding: 22px 16px; color: var(--muted); }
+
+  dialog { border: 1px solid var(--line); border-radius: var(--radius); padding: 0;
+           background: var(--panel); color: var(--ink);
+           width: min(680px, calc(100vw - 32px)); }
+  dialog::backdrop { background: rgb(0 0 0 / .45); }
+  dialog header { display: flex; gap: 12px; align-items: baseline;
+                  padding: 14px 16px; border-bottom: 1px solid var(--line); }
+  dialog h3 { margin: 0; font-size: 15px; font-weight: 600; }
+  dialog .body { padding: 16px; margin: 0; max-height: 56vh; overflow: auto;
+                 white-space: pre-wrap; word-break: break-word; }
+  dialog .foot { margin: 0; padding: 10px 16px; border-top: 1px solid var(--line);
+                 color: var(--muted); font-size: 13px; }
+
+  details { margin-top: 28px; color: var(--muted); }
+  details summary { cursor: pointer; color: var(--ink); font-weight: 550; }
+  details p { max-width: 74ch; }
+  .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
 </style>
 
-<h1>EventProof — current record state</h1>
-<p class="sub">
-  Live from the query API: <code>/v1/activity</code> reads the recent-activity
-  index, then one point read per entity. Clicking a row calls
-  <code>/v1/current-state</code> for that entity alone.
-</p>
+<main>
+  <h1>EventProof — live record state</h1>
+  <p class="lede">
+    Bluesky records as this pipeline currently holds them. Every figure below is read
+    from the query API at the moment shown; nothing is precomputed or sampled offline.
+  </p>
 
-<div class="cards">
-  <div class="card"><b id="lag">–</b><span>source lag</span></div>
-  <div class="card"><b id="age">–</b><span>index freshness</span></div>
-  <div class="card"><b id="served">–</b><span>entities served</span></div>
-  <div class="card"><b id="types">–</b><span>record types</span></div>
-</div>
+  <div class="bar">
+    <button id="toggle" type="button" aria-pressed="false">Pause refresh</button>
+    <button id="now" type="button">Refresh now</button>
+    <label for="limit">Sample size</label>
+    <select id="limit">
+      <option>20</option>
+      <option selected>50</option>
+      <option>100</option>
+      <option>200</option>
+    </select>
+    <span class="spacer"></span>
+    <span id="badge" class="badge live">loading</span>
+  </div>
+  <p id="status" role="status" aria-live="polite">Loading the first sample…</p>
 
-<p id="error"></p>
-<table>
-  <thead><tr><th>entity type</th><th>entity id</th><th>event</th><th>revision</th><th>event time</th></tr></thead>
-  <tbody id="rows"></tbody>
-</table>
-<pre id="detail" hidden></pre>
+  <h2>This sample</h2>
+  <dl class="figures">
+    <div class="figure">
+      <dt>Records shown</dt>
+      <dd id="shown">–</dd>
+      <span class="note">Distinct entities in this sample, capped by the sample size. Not a total.</span>
+    </div>
+    <div class="figure">
+      <dt>Newest source event</dt>
+      <dd id="sourceAge">–</dd>
+      <span class="note">Age of the newest Bluesky timestamp in this sample. One observation, not a latency percentile.</span>
+    </div>
+    <div class="figure">
+      <dt>Newest index entry</dt>
+      <dd id="indexAge">–</dd>
+      <span class="note">Age of the newest activity-index entry, measured against the API's own clock.</span>
+    </div>
+    <div class="figure">
+      <dt>Record types</dt>
+      <dd id="typeCount">–</dd>
+      <ul class="types" id="types"></ul>
+    </div>
+  </dl>
+
+  <h2>Records in this sample</h2>
+  <div class="scroll">
+    <table>
+      <caption>Newest first. Choose a record to read it back from storage on its own.</caption>
+      <thead>
+        <tr>
+          <th scope="col">Type</th>
+          <th scope="col">Record</th>
+          <th scope="col">Event</th>
+          <th scope="col">Revision</th>
+          <th scope="col">Source time (UTC)</th>
+        </tr>
+      </thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <p class="empty" id="empty" hidden></p>
+  </div>
+
+  <details>
+    <summary>How this page reads the data</summary>
+    <p>
+      Two endpoints, both on the private Cloud Run service.
+      <code>/v1/activity</code> reads at most the sample size of rows from a
+      recent-activity index whose row keys carry the complement of each event's
+      receive time, so the newest entries come back from a bounded prefix read
+      rather than a table scan. Index entries older than one hour are excluded on
+      read as well as collected by the column family's max-age rule. Each entity
+      is then read through its own row, so a record its account has hidden drops
+      out of the list instead of being shown.
+    </p>
+    <p>
+      Choosing a record calls <code>/v1/current-state</code> for that entity
+      alone: one point read of one row.
+    </p>
+    <p>
+      There is no chart here. A bounded sample of the newest entries is not a
+      time series, and this page holds no history of its own, so a chart drawn
+      from it would imply measurements that were never taken. Throughput,
+      latency and resource charts are in Cloud Monitoring, which measures them.
+    </p>
+  </details>
+</main>
+
+<dialog id="detail" aria-labelledby="detailTitle">
+  <header>
+    <h3 id="detailTitle">Record</h3>
+    <span style="flex:1"></span>
+    <button id="close" type="button">Close</button>
+  </header>
+  <pre class="body mono" id="detailBody" tabindex="0"></pre>
+  <p class="foot">Re-read from storage on every refresh while this panel is open.</p>
+</dialog>
 
 <script>
   const $ = id => document.getElementById(id);
-  const seconds = ms => ms < 1000 ? Math.round(ms) + " ms" : (ms / 1000).toFixed(1) + " s";
+  const INTERVAL = 5000;
+  const SHORT = {"app.bsky.feed.like": "like", "app.bsky.feed.post": "post",
+                 "app.bsky.feed.repost": "repost", "account": "account"};
+
+  let timer = null;
+  let inFlight = false;       // one request at a time: a slow reply must not stack up
+  let lastSuccess = null;
+  let selected = null;        // entity key, so the row keeps its mark across re-renders
+  let watching = null;        // the open panel's record, re-read on every refresh
+
+  const age = ms => ms < 0 ? "0 ms"
+    : ms < 1000 ? Math.round(ms) + " ms"
+    : ms < 60000 ? (ms / 1000).toFixed(1) + " s"
+    : Math.floor(ms / 60000) + " min " + String(Math.floor(ms / 1000) % 60).padStart(2, "0") + " s";
 
   async function json(path) {
-    const response = await fetch(path);
-    if (!response.ok) throw new Error(path + " returned " + response.status);
+    const abort = AbortSignal.timeout(10000);
+    const response = await fetch(path, {signal: abort, headers: {Accept: "application/json"}});
+    if (!response.ok) throw new Error(path.split("?")[0] + " answered " + response.status);
     return response.json();
   }
 
+  function setState(kind, text) {
+    $("badge").className = "badge " + kind;
+    $("badge").textContent = kind;
+    const since = lastSuccess
+      ? "Last successful update " + age(Date.now() - lastSuccess) + " ago, at "
+        + new Date(lastSuccess).toISOString().replace("T", " ").slice(0, 19) + " UTC."
+      : "No successful update yet.";
+    $("status").textContent = text ? text + " " + since : since;
+  }
+
+  function render(activity) {
+    const observed = Date.parse(activity.observed_at);
+    const records = activity.records;
+
+    $("shown").textContent = records.length;
+    $("indexAge").textContent = activity.latest_event_at
+      ? age(observed - Date.parse(activity.latest_event_at)) : "–";
+    const newest = records.reduce((max, r) => Math.max(max, Date.parse(r.event_time)), 0);
+    $("sourceAge").textContent = newest ? age(observed - newest) : "–";
+
+    const counts = new Map();
+    for (const record of records) {
+      counts.set(record.entity_type, (counts.get(record.entity_type) || 0) + 1);
+    }
+    $("typeCount").textContent = counts.size;
+    $("types").replaceChildren(...[...counts].sort((a, b) => b[1] - a[1]).map(([type, count]) => {
+      const item = document.createElement("li");
+      item.title = type;
+      item.innerHTML = "";
+      item.append(SHORT[type] || type, " ");
+      const bold = document.createElement("b");
+      bold.textContent = count;
+      item.append(bold);
+      return item;
+    }));
+
+    $("empty").hidden = records.length > 0;
+    $("empty").textContent = records.length
+      ? "" : "No index entries in the last hour. The pipeline may be stopped.";
+
+    $("rows").replaceChildren(...records.map(record => {
+      const row = document.createElement("tr");
+      const key = record.entity_type + "\t" + record.entity_id;
+      if (key === selected) row.setAttribute("aria-current", "true");
+
+      const type = document.createElement("td");
+      type.textContent = SHORT[record.entity_type] || record.entity_type;
+      type.title = record.entity_type;
+
+      const cell = document.createElement("td");
+      const open = document.createElement("button");
+      open.type = "button";
+      open.className = "link mono";
+      open.textContent = record.entity_id;
+      open.addEventListener("click", () => show(record));
+      cell.append(open);
+
+      row.append(type, cell);
+      for (const value of [record.event_type, record.revision, record.event_time]) {
+        const td = document.createElement("td");
+        td.className = "num mono";
+        td.textContent = value;
+        row.append(td);
+      }
+      return row;
+    }));
+  }
+
   async function refresh() {
+    if (inFlight) return;
+    inFlight = true;
     try {
-      const activity = await json("/v1/activity?limit=50");
-      $("error").textContent = "";
-      const observed = Date.parse(activity.observed_at);
-      const records = activity.records;
-
-      $("age").textContent = activity.latest_event_at
-        ? seconds(observed - Date.parse(activity.latest_event_at)) : "–";
-      // Bluesky's own timestamp on the newest record we serve, against our clock.
-      const newest = records.reduce(
-        (max, r) => Math.max(max, Date.parse(r.event_time)), 0);
-      $("lag").textContent = newest ? seconds(observed - newest) : "–";
-      $("served").textContent = records.length;
-      $("types").textContent = new Set(records.map(r => r.entity_type)).size;
-
-      $("rows").replaceChildren(...records.map(record => {
-        const row = document.createElement("tr");
-        row.dataset.entity = record.entity_type + "\t" + record.entity_id;
-        for (const cell of [record.entity_type, record.entity_id,
-                            record.event_type, record.revision, record.event_time]) {
-          const td = document.createElement("td");
-          td.textContent = cell;
-          row.append(td);
-        }
-        return row;
-      }));
+      render(await json("/v1/activity?limit=" + $("limit").value));
+      lastSuccess = Date.now();
+      setState(timer ? "live" : "paused", "");
+      // The newest entries turn over in under a second, so a chosen record leaves
+      // the sample almost at once. Keeping it means re-reading it, not holding a row.
+      if (watching) await readDetail(watching, true);
     } catch (failure) {
-      $("error").textContent = failure.message;
+      setState("error", failure.message + ".");
+    } finally {
+      inFlight = false;
     }
   }
 
-  $("rows").addEventListener("click", async event => {
-    const row = event.target.closest("tr[data-entity]");
-    if (!row) return;
-    const [type, id] = row.dataset.entity.split("\t");
-    const query = "entity_type=" + encodeURIComponent(type)
-      + "&entity_id=" + encodeURIComponent(id);
-    const detail = $("detail");
-    detail.hidden = false;
-    detail.textContent = "GET /v1/current-state?" + query + "\n\n"
-      + JSON.stringify(await json("/v1/current-state?" + query), null, 2);
-  });
+  function show(record) {
+    selected = record.entity_type + "\t" + record.entity_id;
+    watching = record;
+    $("detailTitle").textContent = record.entity_type + " " + record.entity_id;
+    $("detail").showModal();
+    readDetail(record, false);
+  }
 
-  refresh();
-  setInterval(refresh, 5000);
+  async function readDetail(record, quiet) {
+    const query = "entity_type=" + encodeURIComponent(record.entity_type)
+      + "&entity_id=" + encodeURIComponent(record.entity_id);
+    const header = "GET /v1/current-state?" + query + "\n";
+    if (!quiet) $("detailBody").textContent = header + "\nReading…";
+    try {
+      const current = await json("/v1/current-state?" + query);
+      $("detailBody").textContent = header + "read at " + new Date().toISOString()
+        + "\n\n" + JSON.stringify(current, null, 2);
+    } catch (failure) {
+      $("detailBody").textContent = header + "\n" + failure.message
+        + "\n\nA record can stop being served after it appears in the sample: its account"
+        + "\nmay have been deactivated, or a purge may have removed it.";
+    }
+  }
+
+  function start() {
+    timer = setInterval(tick, INTERVAL);
+    $("toggle").textContent = "Pause refresh";
+    $("toggle").setAttribute("aria-pressed", "false");
+    refresh();
+  }
+
+  function stop() {
+    clearInterval(timer);
+    timer = null;
+    $("toggle").textContent = "Resume refresh";
+    $("toggle").setAttribute("aria-pressed", "true");
+    setState("paused", "Refresh paused.");
+  }
+
+  // A run of failures must show as stale rather than as a frozen but healthy page.
+  function tick() {
+    if (lastSuccess && Date.now() - lastSuccess > 3 * INTERVAL) setState("stale", "");
+    refresh();
+  }
+
+  $("toggle").addEventListener("click", () => timer ? stop() : start());
+  $("now").addEventListener("click", refresh);
+  $("limit").addEventListener("change", refresh);
+  $("close").addEventListener("click", () => $("detail").close());
+  $("detail").addEventListener("close", () => { watching = null; });
+  start();
 </script>
+</html>
