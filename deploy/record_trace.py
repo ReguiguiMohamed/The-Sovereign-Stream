@@ -48,6 +48,23 @@ def credential(path):
         return response.read().decode()
 
 
+def identity_token(access, audience):
+    """
+    Cloud Build's metadata server serves no identity token, so the build's own
+    identity mints one for itself through the IAM Credentials API.
+    """
+    email = credential("/email")
+    status, body = fetch(
+        "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/"
+        + urllib.parse.quote(email) + ":generateIdToken",
+        {"Authorization": "Bearer " + access, "Content-Type": "application/json"},
+        json.dumps({"audience": audience, "includeEmail": True}).encode())
+    if status != 200:
+        raise SystemExit("could not mint an identity token for {}: {} {}".format(
+            email, status, body))
+    return body["token"]
+
+
 def captured(project, instance, table, access):
     """Entity ids (did/rkey) of the likes currently in the table."""
     prefix = ENTITY_TYPE + "#"
@@ -129,8 +146,8 @@ def main(argv):
         raise SystemExit("the API answered {} without a token; it must stay private".format(status))
     print("ACCEPT unauthenticated request rejected with", status)
 
-    identity = credential("/identity?audience=" + urllib.parse.quote(outputs["api_url"], safe=""))
     access = json.loads(credential("/token"))["access_token"]
+    identity = identity_token(access, outputs["api_url"])
     entities = captured(project, outputs["bigtable_instance"], outputs["bigtable_table"], access)
     if not entities:
         raise SystemExit("the table holds no captured " + ENTITY_TYPE + " record yet")
