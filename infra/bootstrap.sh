@@ -8,6 +8,9 @@
 set -euo pipefail
 P=eventproof-stream-2609
 REGION=europe-west1
+# Billing budgets are charged to the caller's own project, not to --project, so
+# the script runs against this one whatever gcloud is configured for.
+export CLOUDSDK_CORE_PROJECT=$P
 BILLING_ACCOUNT=012271-AC40A5-6D1C29
 : "${BIGTABLE_INSTANCE:?the free-trial Bigtable instance id}"
 BUILD=cloud-build@$P.iam.gserviceaccount.com

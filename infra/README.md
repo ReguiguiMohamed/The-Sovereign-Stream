@@ -22,7 +22,13 @@ Scheduler, Cloud Billing.
 [`bootstrap.sh`](bootstrap.sh) creates the runtime identities, grants the
 deployment identity one role per stated purpose, and creates the gross-cost
 budget alerts. It is owner-run and rerunnable, so Terraform never holds
-project-wide policy control.
+project-wide policy control. It takes the free-trial instance id in
+`BIGTABLE_INSTANCE`, so that instance must exist first: the script grants
+Bigtable roles on it.
+
+Budgets are charged to the caller's own project rather than to `--project`, so
+the script pins `CLOUDSDK_CORE_PROJECT` to this project and runs correctly from
+a shell configured for another one.
 
 Two of its grants are easy to get wrong and are called out in the script:
 `cloud-build` needs `roles/iam.serviceAccountUser` **on** `teardown-scheduler`
@@ -43,6 +49,20 @@ Destroyed only by an explicit decision, never by the scheduled teardown:
 | --- | --- |
 | Bigtable free-trial instance | One per project, for the lifetime of the project: deleting it forfeits any further trial instance. Console-created, referenced by `bigtable_instance`. Its `current-state` table and data belong to the evidence root and go with the window. |
 | Bootstrap buckets, registry, identities | Outlive the windows; cost is storage only. |
+
+### What the free-trial instance is
+
+From Google's [free trial instances overview](https://docs.cloud.google.com/bigtable/docs/free-trial-instance),
+the shape the evidence stack has to fit:
+
+- One cluster of one node, SSD, up to 500 GB. Scaling and replication are off.
+- Ten tables per instance. The evidence root creates one, `current-state`.
+- Ten days from creation, extended to 90 by billing being enabled on the project.
+  When it ends the instance stops serving and keeps the data for a 30-day grace
+  period. Every window has to sit inside the trial.
+- Deleting it is final: no second free-trial instance in this project, ever.
+- Region availability can differ from standard instances, so the region is
+  chosen in the Console at creation, not assumed.
 
 ## Terraform
 
