@@ -35,7 +35,11 @@ $ErrorActionPreference = 'Stop'
 $started = @()
 
 function Require-Command([string]$Name) {
-  $command = Get-Command $Name -ErrorAction SilentlyContinue
+  # A name can resolve to several commands; gcloud ships gcloud.ps1, gcloud.cmd and a
+  # bash script. Start-Process needs the real executable, so skip the scripts.
+  $command = Get-Command $Name -All -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandType -eq 'Application' -and $_.Source -match '\.(exe|cmd|bat)$' } |
+    Select-Object -First 1
   if (-not $command) { throw "$Name is not on PATH." }
   return $command.Source
 }
@@ -119,7 +123,7 @@ try {
   Write-Host "dashboard  $dashboard" -ForegroundColor Green
   Write-Host "Flink UI   $flink      (this is Flink's own UI, not Google Cloud)" -ForegroundColor Green
 
-  $console = [ordered]@{
+  $consoleLinks = [ordered]@{
     'Cloud Build'   = "https://console.cloud.google.com/cloud-build/builds;region=$Region?project=$Project"
     'Artifacts'     = "https://console.cloud.google.com/artifacts/docker/$Project/$Region/eventproof?project=$Project"
     'GKE workloads' = "https://console.cloud.google.com/kubernetes/workload/overview?project=$Project"
@@ -134,12 +138,12 @@ try {
   if (-not $NoBrowser) {
     Start-Process $dashboard
     Start-Process $flink
-    if ($Console) { foreach ($url in $console.Values) { Start-Process $url; Start-Sleep -Milliseconds 400 } }
+    if ($Console) { foreach ($url in $consoleLinks.Values) { Start-Process $url; Start-Sleep -Milliseconds 400 } }
   }
 
   Write-Host ""
   Write-Host "Console pages, in recording order:"
-  foreach ($name in $console.Keys) { "  {0,-14} {1}" -f $name, $console[$name] | Write-Host }
+  foreach ($name in $consoleLinks.Keys) { "  {0,-14} {1}" -f $name, $consoleLinks[$name] | Write-Host }
 
   Write-Host ""
   Read-Host "Press Enter to stop the endpoints this script started"
@@ -148,7 +152,8 @@ finally {
   foreach ($process in $started) {
     if ($process -and -not $process.HasExited) {
       Write-Host "stopping pid $($process.Id)"
-      Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+      # gcloud is a wrapper; the proxy that holds the port is its child, so kill the tree.
+      & taskkill.exe /PID $process.Id /T /F 2>$null | Out-Null
     }
   }
 }
