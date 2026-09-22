@@ -25,7 +25,7 @@ stored one, a check made on the server itself.
 > The cloud project has been offline since its free trial ended on
 > 21 September 2026. This recording is the system running live.
 
-https://github.com/user-attachments/assets/071fd02f-c3e6-43b3-a9e4-7b9db5f908cd
+https://github.com/user-attachments/assets/68be3690-6560-4570-825d-0b2c777a329e
 
 Recorded in the Google Cloud Console on 19 and 20 September 2026. In order:
 Cloud Build, the producer's live log, Managed Kafka, the Flink job and its
@@ -61,7 +61,7 @@ minutes.
 | [Crash recovery](deploy/README.md#acceptance) | TaskManager deleted mid-stream, job back from checkpoint 826, 7,222 records written after |
 | Private API | a call without a token gets 403 |
 | [One record, end to end](deploy/README.md#acceptance) | a like followed from Jetstream to the API, then confirmed against Bluesky's own API |
-| [Tests](streaming/README.md#tests) | 34, plus 11 bugs put back on purpose, each one caught |
+| [Tests](streaming/README.md#tests) | 34, plus 11 bugs put back on purpose, [each one caught](https://github.com/ReguiguiMohamed/The-Sovereign-Stream/actions/runs/35784341235) |
 | [Estimated cost](docs/cost-estimate.md) | USD 0.64 to 0.86 an hour, mostly Kafka |
 
 ## Repository

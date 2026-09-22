@@ -38,7 +38,8 @@ a purge that ignores sequence, a commit after a failed send, and six more. Each
 edit must make its named tests fail with a JUnit assertion. A compile error or a
 crash fails the check instead of passing it.
 
-It runs by hand from the CI workflow: Actions, CI, Run workflow.
+It runs by hand from the CI workflow: Actions, CI, Run workflow. On
+22 September 2026 it caught all 11 ([run 35784341235](https://github.com/ReguiguiMohamed/The-Sovereign-Stream/actions/runs/35784341235)).
 
 ## Jetstream sample
 
