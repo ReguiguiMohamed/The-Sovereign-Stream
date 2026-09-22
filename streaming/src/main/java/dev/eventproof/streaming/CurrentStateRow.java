@@ -21,8 +21,7 @@ import java.util.HashMap;
 import java.util.Map;
 
 /**
- * The Bigtable current-state row contract, described in
- * docs/adr/0002-bigtable-current-state.md.
+ * The Bigtable current-state row contract, described in streaming/README.md.
  *
  * <p>Every write is a check-and-mutate: the server compares the stored order key
  * with the new one and applies the mutation atomically only when the new one is

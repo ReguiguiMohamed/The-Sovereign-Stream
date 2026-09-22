@@ -1,100 +1,141 @@
 # Streaming
 
-One Maven module on Flink 2.2.1 and JDK 17. It builds a single shaded jar with
-three entrypoints.
+All the Java lives here, in one Maven module on Java 17 and Flink 2.2.1. It
+builds a single shaded jar with three entry points, packed into two images by
+the [Dockerfile](Dockerfile).
 
-| Entrypoint | Runs on | Does |
+| Entry point | Runs on | What it does |
 | --- | --- | --- |
-| `JetstreamProducer` | GKE | Reads Bluesky Jetstream v2 and publishes `record-state.v1` in Kafka transactions |
-| `CurrentStateJob` | Flink on GKE | Kafka topic → newest revision per record → Bigtable |
-| `CurrentStateApi` | Cloud Run | `GET /v1/current-state?entity_type=&entity_id=` |
+| [`JetstreamProducer`](src/main/java/dev/eventproof/streaming/JetstreamProducer.java) | GKE | Reads Bluesky Jetstream v2 and writes `record-state.v1` events to Kafka in transactions |
+| [`CurrentStateJob`](src/main/java/dev/eventproof/streaming/CurrentStateJob.java) | Flink on GKE | Kafka topic to newest revision per record to Bigtable |
+| [`CurrentStateApi`](src/main/java/dev/eventproof/streaming/CurrentStateApi.java) | Cloud Run | Read API, plus the live dashboard at `/` |
 
-Only `CurrentStateJob` and `ParseRecordState` use Flink; the producer and the API
-run on a plain JRE.
+The `flink-job` image is the official Flink image with the jar and the Cloud
+Storage filesystem plugin for checkpoints. The `service` image is a Temurin 17
+JRE that runs the producer or the API, whichever class the container is given.
+Flink stays on 2.2.1 because the Flink Kubernetes Operator 1.15.0 supports up to
+2.2.x.
 
-## Record contract
+## The event
 
-[`contracts/record-state.v1.schema.json`](../contracts/record-state.v1.schema.json).
-One event is one revision of one record, or one account-level marker.
+Every component speaks one format,
+[`record-state.v1`](../contracts/record-state.v1.schema.json). An event is one
+revision of one Bluesky record, or a marker for a whole account.
 
 | Field | Record | Account marker |
 | --- | --- | --- |
-| `entity_type` | `collection`: post, like or repost | `account` or `sync` |
+| `entity_type` | the collection: `app.bsky.feed.post`, `.like` or `.repost` | `account` or `sync` |
 | `entity_id` | `did/rkey` | `did` |
-| `event_type` | `create`, `update`, `delete` | `account` or `sync` |
-| `state` | `active`, or `deleted` for a delete | `active`, the source status, or `resynced` |
-| `revision` | `rev`, the repository commit TID | the zero-padded `seq` |
-| `source_seq` | Jetstream `seq`, the resume cursor | same |
-| `subject` | the liked or reposted post URI, otherwise null | null |
-| `event_id` | SHA-256 of entity type, id, revision and event type | same |
+| `event_type` | `create`, `update` or `delete` | same as `entity_type` |
+| `state` | `active`, or `deleted` after a delete | `active`, the account status, or `resynced` |
+| `revision` | `rev`, the commit's TID | the zero-padded `source_seq` |
+| `source_seq` | Jetstream `seq`, also the resume cursor | same |
+| `subject` | the post a like or repost points to, otherwise null | null |
+| `event_id` | SHA-256 of type, id, revision and event type | same |
 
-Record bodies are not kept. Identity events change no record and are counted,
-not published. Anything else malformed goes to the quarantine topic.
+Post text and media are dropped at the producer. Identity events change no
+record, so they are counted and skipped, while a message that fails validation
+goes to the quarantine topic with the reason in a Kafka header.
 
 ## Ordering
 
-`escape(entity_type)#escape(entity_id)` keys Flink state and the Bigtable row.
+Flink state and the Bigtable row share one key,
+`escape(entity_type)#escape(entity_id)`. Escaping turns `%` into `%25` and `#`
+into `%23`, which leaves exactly one raw `#` as the separator, so two different
+records can never share a key.
 
-Flink emits a revision only when it sorts after the last one emitted for that
-record, so a redelivery is dropped and arrival order does not matter. Its state
-expires after 3 days, the topic retention.
+Flink remembers the last revision it passed on for each record and drops
+anything that doesn't sort after it. That removes most repeated writes.
+Correctness lives one step later, in Bigtable.
 
-Storage does not depend on that. Every write is a check-and-mutate: Bigtable
-compares the stored revision with the new one and applies the mutation only when
-the new one is greater. Two revisions inside one millisecond, a batch retry, a
-cold replay and expired Flink state all converge on the newest revision.
+A Bigtable cell timestamp stops at milliseconds. A Bluesky revision is a TID,
+which carries microseconds and a clock id, so two revisions of one record can
+land in the same millisecond. Timestamps can't order them. Each write is a
+check-and-mutate instead: the server compares the stored `revision` with the
+incoming one and applies the write only when the incoming one is greater.
+Revisions are fixed-width strings, so byte order is time order.
 
-## Account lifecycle
+```mermaid
+sequenceDiagram
+    participant F as Flink sink
+    participant B as Bigtable row
+    F->>B: delete, revision r2, only if the stored revision is older
+    B-->>F: applied
+    Note over F,B: a restart replays the create that came before it
+    F->>B: create, revision r1, only if the stored revision is older
+    B-->>F: not applied, r2 is newer
+```
 
-An account event with `active: false, status: deleted`, or a sync event, removes
-the account's earlier records: the account row's purge boundary is raised to that
-sequence, and each of the account's record rows whose sequence is at or below it
-is deleted, conditionally, so later records stay. A record read also checks the
-account row, so a record is hidden while the account is inactive and after a
-purge, even if a replay rewrites it.
+Same-millisecond revisions, retried batches and a replay into empty Flink state
+all end on the newest revision. Writing the same revision twice changes nothing.
+Because the server settles every write, the sink keeps up to 256 of them in
+flight at once. Flink waits for all of them at each checkpoint, so a checkpoint
+never covers an update that hasn't landed.
 
-## Producer delivery
+## Accounts
 
-- One Kafka transaction per batch. The batch commits only after every send in it
-  has succeeded, so a failed send cannot be passed by a later one.
-- The cursor is the highest committed sequence; on start it is read back from the
-  record topic with `read_committed`.
-- The Jetstream cursor is inclusive, so the boundary event is redelivered and
-  dropped by its revision.
-- The transactional id fences a previous instance, and any Kafka failure ends the
-  process; the restart resumes from the committed cursor.
-- One JSON stats line a minute: received, published, identity-skipped,
+An account event with `active: false` and `status: deleted`, or any sync event,
+purges that account's earlier records. The account row's purge boundary rises to
+the event's sequence, then every record row of the account at or below it is
+deleted, each delete conditional on the same comparison, so records written
+later survive. Reads check the account row too. A record stays hidden while its
+account is inactive, and after a purge, even if a replay writes it again.
+
+## Producer
+
+- One Kafka transaction per batch of up to 2,000 messages. The batch commits
+  only after every send in it succeeded, so a failed send can't be overtaken by
+  a later one.
+- The resume cursor is the highest committed sequence, read back from the record
+  topic with `read_committed` on start. Jetstream's cursor is inclusive, so the
+  boundary event arrives again and Flink drops it by its revision.
+- A fixed transactional id fences any older instance. Any Kafka error ends the
+  process, and the restart resumes from the committed cursor.
+- It alternates between the us-east and us-west Jetstream instances when it
+  reconnects, and gives up once ten retries fail in a row.
+- It logs one JSON line a minute: received, published, identity skipped,
   quarantined, cursor.
 
 ## Query API
 
-| Case | Response |
+| Request | Answer |
 | --- | --- |
-| record present and visible | `200`, the stored event |
-| absent, purged, or account inactive | `404 {"error":"not_found"}` |
+| `GET /v1/current-state?entity_type=&entity_id=` | `200` with the stored event, or `404` when it is absent, purged or its account is inactive |
+| `GET /v1/activity?limit=` | the records changed in the last hour, newest first, 50 by default and 200 at most |
+| `GET /` | the dashboard, which reads the two endpoints above |
 | missing, blank or repeated parameter | `400 {"error":"invalid_request"}` |
-| method other than GET | `405` with `Allow: GET` |
+| any method other than `GET` | `405` with `Allow: GET` |
 
-One request reads at most two rows: the record and its account. The server uses
-16 workers, matching Cloud Run concurrency, and shuts down on SIGTERM. Access
-control is Cloud Run IAM.
+A lookup reads at most two rows, the record and its account. The activity list
+reads index rows whose keys hold the complement of the receive time, so a plain
+prefix read comes back newest first, then does one point read per record. No
+request scans the table. The index lives in the `act` column family, which
+expires cells after an hour, and reads apply the same hour because Bigtable
+collects garbage lazily.
+
+The server runs 16 workers to match the Cloud Run concurrency setting, stops
+cleanly on SIGTERM, and has no login of its own, because Cloud Run IAM decides
+who gets in.
 
 ## Tests
 
-[`cloudbuild.yaml`](../cloudbuild.yaml) runs `mvn verify`, builds both images and
-then [`tools/image-smoke.sh`](../tools/image-smoke.sh), which runs the packaged
-images against live Jetstream, a Kafka broker and the Bigtable emulator, and
-restarts the producer to check its resume cursor.
+`mvn --file streaming/pom.xml verify` runs 34 tests on JDK 17. The Bigtable
+tests use Google's emulator, which the test dependency bundles, and the Kafka
+tests use the client's mocks, so nothing needs Docker or a cloud account.
 
-- `CurrentStateJobTest`: redelivery, out-of-order revisions, delete convergence,
-  type isolation, Jetstream mapping, account and sync markers, rejected input.
-- `BigtableCurrentStateTest`: same-millisecond and concurrent writes, stale
-  create after delete, replay with empty Flink state, account purge, flush
-  failure.
-- `CurrentStateApiTest`: the HTTP contract and account visibility.
-- `TransactionalPublisherTest`: failed send, failed commit, quarantine, resume.
-- `SavepointRecoveryTest`: keyed state restored from a savepoint into a job with
-  another source suppresses an older revision.
+| Guarantee | Tests |
+| --- | --- |
+| A redelivered revision is applied once | `CurrentStateJobTest.redeliveredRevisionProducesOneUpdate` |
+| An older revision never replaces a newer one | `CurrentStateJobTest.olderRevisionArrivingLastCannotReplaceNewer`, `BigtableCurrentStateTest.sameMillisecondOlderRevisionWrittenLastIsIgnored`, `concurrentAndRetriedWritesKeepTheNewest`, `replayWithEmptyFlinkStateKeepsTheNewest` |
+| A deleted record stays deleted | `CurrentStateJobTest.deleteAfterCreateBecomesCurrent`, `BigtableCurrentStateTest.staleCreateAfterDeleteIsIgnored` |
+| The same id under two types is two records | `CurrentStateJobTest.sameIdUnderAnotherTypeIsAnotherRecord`, `rowKeySeparatorCannotCollideAcrossEntityTypeAndId` |
+| A deleted account's records are purged, an inactive account's are hidden | `BigtableCurrentStateTest.accountDeletionPurgesEarlierRecordsAndHidesTheRest`, `syncPurgesEarlierRecordsOnlyAndAnOlderPurgeCannotLowerIt`, `CurrentStateApiTest.anInactiveAccountHidesItsRecordsUntilReactivated` |
+| The resume cursor never passes an unpublished message | `TransactionalPublisherTest.anEarlierFailedSendBlocksTheCommitEvenIfLaterSendsSucceed`, `aFailedCommitLeavesTheCursorWhereItWas`, `malformedMessagesAreQuarantinedInTheSameTransaction`, `restartResumesFromTheHighestCommittedSequence` |
+| Keyed state survives a restart | `SavepointRecoveryTest.keyedStateSurvivesStopWithSavepoint` |
 
-[`tools/discrimination-check.sh`](../tools/discrimination-check.sh) reintroduces
-each guarded defect and requires the named tests to report an assertion failure.
+The rest cover the Jetstream mapping, contract validation, the HTTP contract and
+the dashboard.
+
+[`tools/discrimination-check.sh`](../tools/discrimination-check.sh) puts 11 of
+these bugs back, one at a time, and requires the named tests to fail with an
+assertion each time. A build error or a crash doesn't count as a catch.

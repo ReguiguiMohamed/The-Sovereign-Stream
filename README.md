@@ -1,83 +1,96 @@
 # The Sovereign Stream
 
-A public social-activity observatory on GCP. Live Bluesky activity flows through
-Kafka and Flink into Bigtable and is served by a Cloud Run API. Code namespace:
-`eventproof`. Current brief: [cloud initiation](docs/cloud-initiation.md).
+[![CI](https://github.com/ReguiguiMohamed/The-Sovereign-Stream/actions/workflows/ci.yml/badge.svg)](https://github.com/ReguiguiMohamed/The-Sovereign-Stream/actions/workflows/ci.yml)
 
-```text
-Bluesky Jetstream v2
-  -> JetstreamProducer (GKE)
-  -> Managed Service for Apache Kafka
-  -> CurrentStateJob (Flink 2.2.1 on GKE, checkpoints in GCS)
-  -> Bigtable current state
-  -> CurrentStateApi (Cloud Run)
-```
+A streaming pipeline on Google Cloud that followed every Bluesky post, like and
+repost live, and kept each one's current state correct through duplicates,
+replays and crashes.
 
-## Guarantees
+![Bluesky Jetstream flows to a producer on GKE, Managed Kafka, Flink on GKE with checkpoints in Cloud Storage, Bigtable, and a Cloud Run API, all in Google Cloud europe-west1](docs/media/architecture.jpg)
 
-1. A redelivered revision is never applied twice.
-2. An older revision never replaces a newer one: Bigtable compares revisions on
-   the server, so concurrency, retries, replay and expired Flink state converge
-   on the newest.
-3. A deleted record converges to `deleted`.
-4. Records with the same id but different types stay separate.
-5. A deleted account's earlier records are purged, and its records stay hidden
-   while it is inactive.
-6. The producer's resume cursor never passes an unpublished message: each batch
-   is one Kafka transaction, and malformed messages are quarantined in it.
-7. Keyed state restores from a savepoint.
+Bluesky publishes everything that happens on it as a public live feed called
+Jetstream. This pipeline read the posts, likes and reposts from it, a few
+hundred a second, and could say for any of them at any moment whether it still
+existed, which revision was newest and which post a like pointed to.
 
-Each guarantee has a test, and the
-[discrimination check](tools/discrimination-check.sh) requires the named test to
-report an assertion failure when the defect is put back.
+A dropped connection makes Jetstream send messages again, and a job restarting
+from a checkpoint replays events it already wrote, after newer ones. None of
+that could move a record back in time. Flink drops revisions it has already
+passed on, and Bigtable takes a write only when its revision is newer than the
+stored one, a check made on the server itself.
 
-## Done
+## Demo
 
-- GCP project `eventproof-stream-2609` with Cloud Build bootstrap and an
-  owner-run IAM script ([infra](infra/README.md)).
-- `record-state.v1` contract for Bluesky record revisions and account markers
-  ([streaming](streaming/README.md)).
-- Transactional Jetstream producer that resumes from the last committed record.
-- Flink job reading Kafka and writing Bigtable through conditional writes.
-- Query API ready for Cloud Run, hiding purged and inactive-account records.
-- [Cloud Build pipeline](cloudbuild.yaml): tests, shaded jar, both images, and a
-  smoke test of the packaged images against live Jetstream.
-- Terraform evidence root and the scheduled, verified teardown it is pinned to.
-- Operator install and workload manifests for GKE, with a deployment
-  [acceptance check](deploy/accept.sh): a running job, a checkpoint in the real
-  bucket, recovery from it after the TaskManager is deleted, and an
-  authenticated API answer confirmed against the record at the source.
-- Runbook for the recorded Console walkthrough
-  ([demo-runbook.md](docs/demo-runbook.md)); the recording itself is still to do.
-- [Jetstream sample](tools/jetstream-sample.yaml) and
-  [cost estimate](docs/cost-estimate.md) from measured traffic.
+> [!NOTE]
+> The cloud project has been offline since its free trial ended on
+> 21 September 2026. This recording is the system running live.
 
-## Build
+https://github.com/user-attachments/assets/071fd02f-c3e6-43b3-a9e4-7b9db5f908cd
 
-```bash
-gcloud builds submit --config=cloudbuild.yaml --region=europe-west1 \
-  --project=eventproof-stream-2609 \
-  --gcs-source-staging-dir=gs://eventproof-stream-2609-build-source/source \
-  --service-account=projects/eventproof-stream-2609/serviceAccounts/cloud-build@eventproof-stream-2609.iam.gserviceaccount.com
-```
+Recorded in the Google Cloud Console on 19 and 20 September 2026. In order:
+Cloud Build, the producer's live log, Managed Kafka, the Flink job and its
+checkpoints, the dashboard, Bigtable, Cloud Run and Cloud Monitoring. The
+original file is attached to the
+[v1.0.0 release](https://github.com/ReguiguiMohamed/The-Sovereign-Stream/releases/tag/v1.0.0).
 
-## Repository map
+## How it works
+
+1. **The producer**, a Java process on GKE, holds one WebSocket to Jetstream,
+   drops post text and media, and writes each batch to Kafka in a single
+   transaction. Its resume point never gets ahead of what Kafka safely holds.
+2. **Managed Kafka** keeps three days of events on one partition.
+3. **Flink** on GKE groups events by record and passes on only revisions newer
+   than the last one it saw. It checkpoints to Cloud Storage every 30 seconds.
+4. **Bigtable** holds one row per record. The server applies a write only if its
+   revision is newer than the stored one.
+5. **Cloud Run** serves a small read API and a live dashboard. It is private, so
+   only callers with IAM access get through.
+
+Terraform defines the infrastructure, and Cloud Build ran all of it: tests,
+images, plans, deploys, and a teardown build that checked the deadline every 15
+minutes.
+
+## Results
+
+| Check | Result |
+| --- | --- |
+| Live window | 18 to 21 September 2026, `europe-west1` |
+| Events read | 18,766,837 by 19 September at 15:40 UTC, none quarantined |
+| Throughput | about 330 records a second, the live Bluesky rate at the time |
+| Freshness | newest record on the dashboard under 200 ms old once caught up |
+| [Crash recovery](deploy/README.md#acceptance) | TaskManager deleted mid-stream, job back from checkpoint 826, 7,222 records written after |
+| Private API | a call without a token gets 403 |
+| [One record, end to end](deploy/README.md#acceptance) | a like followed from Jetstream to the API, then confirmed against Bluesky's own API |
+| [Tests](streaming/README.md#tests) | 34, plus 11 bugs put back on purpose, each one caught |
+| [Estimated cost](docs/cost-estimate.md) | USD 0.64 to 0.86 an hour, mostly Kafka |
+
+## Repository
+
+Code, images and cloud resources use the name `eventproof`.
 
 | Path | Contents |
 | --- | --- |
-| [`contracts/`](contracts/) | Event schema |
-| [`streaming/`](streaming/README.md) | Producer, Flink job, Bigtable contract, query API, Dockerfile |
-| [`tools/`](tools/) | Cloud Build sample and discrimination check |
-| [`infra/`](infra/README.md) | Bootstrap record and Terraform roots |
-| [`deploy/`](deploy/) | Flink operator install and Kubernetes workloads |
-| [`docs/`](docs/) | Briefs, decisions and checkpoints |
+| [`streaming/`](streaming/) | the producer, the Flink job, the query API and dashboard, and their tests |
+| [`contracts/`](contracts/) | JSON Schema for the one event format every part shares |
+| [`infra/`](infra/) | Terraform, the owner IAM script, the scheduled teardown |
+| [`deploy/`](deploy/) | Kubernetes workloads and the acceptance check |
+| [`tools/`](tools/) | packaged-image smoke test, mutation check, Jetstream sampler |
+| [`docs/`](docs/) | cost estimate and images |
+| [`cloudbuild.yaml`](cloudbuild.yaml) | tests, both images and the smoke test, in Cloud Build |
+
+## Built with
+
+Java 17, Apache Flink 2.2.1, Flink Kubernetes Operator 1.15, Google Cloud
+Managed Service for Apache Kafka, GKE, Bigtable, Cloud Run, Cloud Storage, Cloud
+Monitoring, Cloud Scheduler, Terraform 1.16 and Cloud Build.
 
 ## Data
 
-Bluesky public data through the free live Jetstream endpoint. Record bodies,
-text and media are not stored. See Bluesky's
-[developer guidelines](https://bsky.network/docs/developer-guidelines/).
+Public Bluesky data from the free Jetstream endpoint, used under Bluesky's
+[developer guidelines](https://bsky.network/docs/developer-guidelines/). The
+producer kept identifiers, revisions, timestamps and the post each like or
+repost points to. Post text and media were dropped before anything was stored.
 
 ## License
 
-MIT for the code. See [LICENSE](LICENSE).
+[MIT](LICENSE). Built by [Mohamed Reguigui](https://github.com/ReguiguiMohamed).
