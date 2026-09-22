@@ -1,29 +1,18 @@
 __pycache__/
 *.py[cod]
-build/
-*.egg-info/
-.pytest_cache/
-.ruff_cache/
-.venv/
-venv/
-tmp*/
-**/target/
+target/
 
 .terraform/
 *.tfstate
 *.tfstate.*
+*.tfvars
 *.tfplan
 crash.log
 
 .env
-.env.*
-!.env.example
 *.key
 *.pem
 credentials*.json
-
-benchmarks/evidence/*
-!benchmarks/evidence/.gitkeep
 
 .idea/
 .vscode/
