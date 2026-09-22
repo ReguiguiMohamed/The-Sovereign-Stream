@@ -93,4 +93,6 @@ repost points to. Post text and media were dropped before anything was stored.
 
 ## License
 
-[MIT](LICENSE). Built by [Mohamed Reguigui](https://github.com/ReguiguiMohamed).
+[MIT](LICENSE). Built by [Mohamed Reguigui](https://github.com/ReguiguiMohamed),
+with Claude writing the code and Astra (GPT-6) refusing to let any of it through
+untested.
