@@ -14,7 +14,8 @@ steps:
       - -c
       - |
         set -e
-        bash -n tools/image-smoke.sh deploy/accept.sh infra/teardown.sh infra/bootstrap.sh
+        # bash -n checks only its first argument, so one call per script.
+        for script in tools/image-smoke.sh tools/discrimination-check.sh deploy/accept.sh infra/teardown.sh infra/bootstrap.sh; do bash -n "$$script"; done
         PYTHONPATH=infra python3 infra/test_window_guard.py
         PYTHONPATH=deploy python3 -c "import record_trace, recovery_check; record_trace.self_check(); recovery_check.self_check(); print('deploy checks hold')"
 

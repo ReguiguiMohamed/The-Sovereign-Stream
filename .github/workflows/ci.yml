@@ -1,0 +1,52 @@
+# The checks and tests Cloud Build ran, on every push to main and every pull
+# request. The mutation check is slow, so it runs only when started by hand.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    # The image cloudbuild.yaml verifies with, at the same digest.
+    container: maven:3.9.11-eclipse-temurin-17@sha256:e4a7ace3dc0d645ed97f8d9ad0b0d3f0b14fa8d150138f27f116d7105a639b82
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: mvn --batch-mode --no-transfer-progress --file streaming/pom.xml verify
+
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Shell syntax
+        run: for script in tools/*.sh deploy/*.sh infra/*.sh; do bash -n "$script"; done
+      - name: Teardown guard and deploy checks
+        run: |
+          PYTHONPATH=infra python3 infra/test_window_guard.py
+          PYTHONPATH=deploy python3 -c "import record_trace, recovery_check; record_trace.self_check(); recovery_check.self_check(); print('deploy checks hold')"
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: 1.16.3
+          terraform_wrapper: false
+      - name: Terraform
+        run: |
+          terraform fmt -check -recursive infra
+          for root in infra/evidence infra/control; do
+            terraform -chdir="$root" init -backend=false -input=false
+            terraform -chdir="$root" validate
+          done
+
+  mutants:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    container: maven:3.9.11-eclipse-temurin-17@sha256:e4a7ace3dc0d645ed97f8d9ad0b0d3f0b14fa8d150138f27f116d7105a639b82
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: bash tools/discrimination-check.sh
